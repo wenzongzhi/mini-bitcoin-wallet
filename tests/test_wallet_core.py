@@ -1,8 +1,10 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from adapters import BitcoinToolWalletService, DemoWalletService
+from app_settings import ApplicationSettingsStore
 from btc.chainparams import NETWORK_TESTNET4
 from wallet_core import BitcoinAmount, DisplayUnit, WalletApplication
 from wallet import get_wallet_address_book
@@ -120,6 +122,15 @@ class WalletApplicationTests(TestCase):
                 "bc1qdestination", "1", DisplayUnit.BTC, 3
             )
 
+    def test_lists_and_selects_wallet_through_application_boundary(self):
+        wallets = self.application.list_wallets()
+
+        self.assertEqual([wallet.name for wallet in wallets], ["Bitcoin Wallet"])
+        self.assertEqual(
+            self.application.select_wallet("Bitcoin Wallet").name,
+            "Bitcoin Wallet",
+        )
+
 
 class BitcoinToolWalletServiceTests(TestCase):
     def setUp(self):
@@ -140,6 +151,94 @@ class BitcoinToolWalletServiceTests(TestCase):
         self.assertEqual(snapshot.balance.sats, 0)
         self.assertEqual(snapshot.receive_address, "")
         self.assertEqual(snapshot.transactions, ())
+        self.assertEqual(self.service.list_wallets(), ())
+        settings = json.loads(
+            (self.wallet_file.parent / "settings.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            settings,
+            {
+                "version": 1,
+                "active_wallets": {"mainnet": None, "testnet4": None},
+            },
+        )
+
+    def test_multiple_wallets_can_coexist_and_be_listed_without_secrets(self):
+        mnemonics = []
+        for name in ("Wallet_A", "Wallet_B", "Wallet_C"):
+            mnemonics.append(self.service.create_wallet(name, f"password-{name}").mnemonic)
+
+        summaries = self.service.list_wallets()
+
+        self.assertEqual(
+            [wallet.name for wallet in summaries],
+            ["Wallet_A", "Wallet_B", "Wallet_C"],
+        )
+        self.assertTrue(all(wallet.encrypted for wallet in summaries))
+        serialized_summaries = repr(summaries)
+        self.assertTrue(all(mnemonic not in serialized_summaries for mnemonic in mnemonics))
+        settings_text = (self.wallet_file.parent / "settings.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertTrue(all(mnemonic not in settings_text for mnemonic in mnemonics))
+        self.assertNotIn('"encryption"', settings_text)
+
+    def test_switching_wallets_changes_the_active_snapshot(self):
+        self.service.create_wallet("Wallet_A", "password-a")
+        self.service.create_wallet("Wallet_B", "password-b")
+
+        self.assertEqual(self.service.select_wallet("Wallet_B").name, "Wallet_B")
+        self.assertEqual(self.service.select_wallet("Wallet_A").name, "Wallet_A")
+        self.assertEqual(self.service.snapshot().name, "Wallet_A")
+
+    def test_active_wallet_selection_survives_service_restart(self):
+        self.service.create_wallet("Wallet_A", "password-a")
+        self.service.create_wallet("Wallet_B", "password-b")
+        self.service.select_wallet("Wallet_B")
+
+        restarted = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "wallet_cache.json",
+        )
+
+        self.assertEqual(restarted.snapshot().name, "Wallet_B")
+
+    def test_missing_active_wallet_falls_back_to_first_wallet(self):
+        self.service.create_wallet("Wallet_A", "password-a")
+        self.service.create_wallet("Wallet_B", "password-b")
+        settings = ApplicationSettingsStore(self.wallet_file.parent / "settings.json")
+        settings.set_active_wallet("mainnet", "missing-wallet")
+
+        restarted = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "wallet_cache.json",
+        )
+
+        self.assertEqual(restarted.snapshot().name, "Wallet_A")
+        self.assertEqual(settings.active_wallet("mainnet"), "Wallet_A")
+
+    def test_selecting_unknown_wallet_does_not_change_active_wallet(self):
+        self.service.create_wallet("Wallet_A", "password-a")
+
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            self.service.select_wallet("missing-wallet")
+
+        self.assertEqual(self.service.snapshot().name, "Wallet_A")
+
+    def test_mainnet_and_testnet4_remember_independent_active_wallets(self):
+        data_directory = self.wallet_file.parent
+        self.service.create_wallet("MainWallet", "main-password")
+        testnet_service = BitcoinToolWalletService(
+            data_directory / "wallets_testnet4.json",
+            data_directory / "wallet_cache_testnet4.json",
+            network=NETWORK_TESTNET4,
+            settings_file=data_directory / "settings.json",
+        )
+        testnet_service.create_wallet("TestWallet", "test-password")
+
+        settings = ApplicationSettingsStore(data_directory / "settings.json")
+        self.assertEqual(settings.active_wallet("mainnet"), "MainWallet")
+        self.assertEqual(settings.active_wallet("testnet4"), "TestWallet")
 
     def test_create_wallet_encrypts_mnemonic_and_issues_one_receive_address(self):
         creation = self.service.create_wallet("alice", "correct horse battery staple")

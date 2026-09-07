@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from .models import BitcoinAmount, SendPreview, WalletCreation, WalletSnapshot
+from .models import (
+    BitcoinAmount,
+    SendPreview,
+    WalletCreation,
+    WalletSnapshot,
+    WalletSummary,
+)
 
 
 class WalletService(ABC):
@@ -17,6 +23,14 @@ class WalletService(ABC):
     @abstractmethod
     def snapshot(self) -> WalletSnapshot:
         """Return data needed to render the current wallet."""
+
+    @abstractmethod
+    def list_wallets(self) -> tuple[WalletSummary, ...]:
+        """Return non-secret summaries for wallets on the selected network."""
+
+    @abstractmethod
+    def select_wallet(self, name: str) -> WalletSnapshot:
+        """Persist and load the active wallet without decrypting it."""
 
     @abstractmethod
     def rename_wallet(self, name: str) -> WalletSnapshot:

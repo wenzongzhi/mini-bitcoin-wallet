@@ -14,6 +14,7 @@ from .models import (
     TransactionSummary,
     WalletCreation,
     WalletSnapshot,
+    WalletSummary,
 )
 from .ports import WalletService
 
@@ -27,4 +28,5 @@ __all__ = [
     "WalletCreation",
     "WalletService",
     "WalletSnapshot",
+    "WalletSummary",
 ]

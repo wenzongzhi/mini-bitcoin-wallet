@@ -115,6 +115,7 @@ def run_wallet_app(
         wallet_file=data_directory / wallet_filename,
         cache_file=data_directory / cache_filename,
         network=network,
+        settings_file=data_directory / "settings.json",
     )
     BitcoinWalletApp(service, window_title=window_title).mainloop()
 

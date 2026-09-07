@@ -6,6 +6,7 @@ from theme import Theme
 from state import WalletUIState
 from wallet_core import DisplayUnit, TransactionDirection, TransactionSummary
 from wallet_dialogs import create_new_wallet, import_wallet
+from wallet_manager import show_wallet_manager
 from widgets import (
     AmountEntry,
     BitcoinLogo,
@@ -21,6 +22,67 @@ from widgets import (
 from transaction_dialog import format_transaction_time, show_transaction_details
 
 
+class WalletSelector(tk.Frame):
+    """Compact active-wallet menu shared by every wallet header."""
+
+    def __init__(self, master, theme: Theme, state: WalletUIState):
+        super().__init__(master, bg=theme.CARD, bd=0, cursor="hand2", takefocus=True)
+        self.theme = theme
+        self.state = state
+
+        self.name_label = tk.Label(
+            self,
+            textvariable=state.wallet_name,
+            bg=theme.CARD,
+            fg=theme.MUTED,
+            font=theme.font_wallet_title,
+            cursor="hand2",
+        )
+        self.name_label.pack(side="left")
+        self.arrow_label = tk.Label(
+            self,
+            text="▾",
+            bg=theme.CARD,
+            fg=theme.MUTED_2,
+            font=theme.font_small,
+            cursor="hand2",
+            padx=theme.px(5),
+        )
+        self.arrow_label.pack(side="left", pady=(theme.px(3), 0))
+
+        for widget in (self, self.name_label, self.arrow_label):
+            widget.bind("<Button-1>", self._show_menu)
+        self.bind("<Return>", self._show_menu)
+        self.bind("<space>", self._show_menu)
+
+    def _show_menu(self, event=None):
+        menu = tk.Menu(self, tearoff=False, font=self.theme.font_small)
+        for wallet in self.state.wallets:
+            active = wallet.name == self.state.active_wallet_name
+            label = f"{wallet.name}  ✓" if active else wallet.name
+            menu.add_command(
+                label=label,
+                command=lambda name=wallet.name: self._select_wallet(name),
+            )
+        if self.state.wallets:
+            menu.add_separator()
+        menu.add_command(label="Manage Wallets...", command=self._manage_wallets)
+
+        try:
+            menu.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _select_wallet(self, wallet_name: str) -> None:
+        try:
+            self.state.select_wallet(wallet_name)
+        except ValueError as exc:
+            messagebox.showerror("Open Wallet", str(exc), parent=self.winfo_toplevel())
+
+    def _manage_wallets(self) -> None:
+        show_wallet_manager(self.winfo_toplevel(), self.theme, self.state)
+
+
 class WalletHeader(tk.Frame):
     def __init__(self, master, theme: Theme, state: WalletUIState):
         super().__init__(master, bg=theme.CARD, bd=0)
@@ -32,8 +94,7 @@ class WalletHeader(tk.Frame):
         left = tk.Frame(self, bg=theme.CARD, bd=0)
         left.grid(row=0, column=0, sticky="nsew")
 
-        tk.Label(left, textvariable=state.wallet_name, bg=theme.CARD, fg=theme.MUTED,
-                 font=theme.font_wallet_title).pack(anchor="w")
+        WalletSelector(left, theme, state).pack(anchor="w")
         self.balance_font = tkfont.Font(
             root=self,
             family=theme.family,
@@ -101,14 +162,18 @@ class WalletHeader(tk.Frame):
         menu = tk.Menu(self, tearoff=False, font=self.theme.font_small)
         menu.add_command(label="Create new wallet...", command=self._create_wallet)
         menu.add_command(label="Import secret words...", command=self._import_wallet)
-        menu.add_command(label="View secret words", command=self._view_secret_words)
-        menu.add_command(label="Advanced Settings...", command=self._advanced_settings)
         menu.add_separator()
-        fiat = tk.Menu(menu, tearoff=False, font=self.theme.font_small)
+        settings = tk.Menu(menu, tearoff=False, font=self.theme.font_small)
+        settings.add_command(label="Wallets...", command=self._manage_wallets)
+        settings.add_separator()
+        fiat = tk.Menu(settings, tearoff=False, font=self.theme.font_small)
         for code in ("USD", "JPY", "CNY", "EUR"):
             fiat.add_radiobutton(label=code, value=code, variable=self.state.fiat_currency)
-        menu.add_cascade(label="Fiat currency", menu=fiat)
-        menu.add_checkbutton(label="Dark mode", variable=self.state.dark_mode)
+        settings.add_cascade(label="Fiat currency", menu=fiat)
+        settings.add_checkbutton(label="Dark mode", variable=self.state.dark_mode)
+        settings.add_separator()
+        settings.add_command(label="Advanced Settings...", command=self._advanced_settings)
+        menu.add_cascade(label="Settings", menu=settings)
         return menu
 
     def _create_wallet(self):
@@ -117,12 +182,8 @@ class WalletHeader(tk.Frame):
     def _import_wallet(self):
         import_wallet(self.winfo_toplevel(), self.state)
 
-    def _view_secret_words(self):
-        messagebox.showinfo(
-            "View secret words",
-            "Secret-word access will be supplied by the wallet backend.",
-            parent=self.winfo_toplevel(),
-        )
+    def _manage_wallets(self):
+        show_wallet_manager(self.winfo_toplevel(), self.theme, self.state)
 
     def _advanced_settings(self):
         messagebox.showinfo(
@@ -252,6 +313,9 @@ class HomePage(PageBase):
         for child in content.winfo_children():
             child.destroy()
         self._transaction_items = []
+        if not self.state.is_initialized:
+            self._render_empty_wallet_actions(content)
+            return
         if not self.state.transactions:
             tk.Label(
                 content,
@@ -277,6 +341,43 @@ class HomePage(PageBase):
             item.bind("<Next>", lambda _event: self.transaction_list._scroll_pages(1))
             self.transaction_list.bind_mousewheel_tree(item)
             self._transaction_items.append(item)
+
+    def _render_empty_wallet_actions(self, content):
+        empty = tk.Frame(content, bg=self.theme.CARD, bd=0)
+        empty.grid(row=0, column=0, sticky="nsew", pady=self.theme.px(22))
+        empty.grid_columnconfigure(0, weight=1)
+        empty.grid_columnconfigure(1, weight=1)
+        tk.Label(
+            empty,
+            text="No wallet is open",
+            bg=self.theme.CARD,
+            fg=self.theme.TEXT_SOFT,
+            font=self.theme.font_body_bold,
+        ).grid(row=0, column=0, columnspan=2, pady=(0, self.theme.px(5)))
+        tk.Label(
+            empty,
+            text="Create a new wallet or import your secret words.",
+            bg=self.theme.CARD,
+            fg=self.theme.MUTED,
+            font=self.theme.font_small,
+        ).grid(row=1, column=0, columnspan=2, pady=(0, self.theme.px(14)))
+        RoundedButton(
+            empty,
+            self.theme,
+            text="CREATE WALLET",
+            command=lambda: create_new_wallet(self.winfo_toplevel(), self.state),
+            height=44,
+            radius=14,
+        ).grid(row=2, column=0, sticky="ew", padx=(0, self.theme.px(5)))
+        RoundedButton(
+            empty,
+            self.theme,
+            text="IMPORT WALLET",
+            command=lambda: import_wallet(self.winfo_toplevel(), self.state),
+            fill=self.theme.PURPLE_SOFT,
+            height=44,
+            radius=14,
+        ).grid(row=2, column=1, sticky="ew", padx=(self.theme.px(5), 0))
 
     def _focus_item(self, index):
         if not self._transaction_items:

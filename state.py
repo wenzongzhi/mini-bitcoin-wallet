@@ -12,6 +12,7 @@ from wallet_core import (
     SendPreview,
     WalletApplication,
     WalletCreation,
+    WalletSummary,
 )
 
 
@@ -19,6 +20,7 @@ class WalletUIState:
     def __init__(self, root: tk.Misc, application: WalletApplication):
         self.application = application
         self._snapshot = application.load_wallet()
+        self._wallets = application.list_wallets()
 
         self.display_unit = tk.StringVar(root, value=DisplayUnit.BTC.value)
         self.wallet_name = tk.StringVar(root, value=self._snapshot.name)
@@ -34,6 +36,14 @@ class WalletUIState:
     @property
     def transactions(self):
         return self._snapshot.transactions
+
+    @property
+    def wallets(self) -> tuple[WalletSummary, ...]:
+        return self._wallets
+
+    @property
+    def active_wallet_name(self) -> str | None:
+        return self._snapshot.name if self._snapshot.is_initialized else None
 
     @property
     def unit(self) -> DisplayUnit:
@@ -57,6 +67,9 @@ class WalletUIState:
         self._apply_snapshot(creation.snapshot)
         return creation
 
+    def select_wallet(self, name: str) -> None:
+        self._apply_snapshot(self.application.select_wallet(name))
+
     def apply_wallet_creation(self, creation: WalletCreation) -> None:
         """Apply a wallet created by a background application use case."""
 
@@ -69,6 +82,7 @@ class WalletUIState:
 
     def _apply_snapshot(self, snapshot) -> None:
         self._snapshot = snapshot
+        self._wallets = self.application.list_wallets()
         self.wallet_name.set(snapshot.name)
         self.receive_address.set(snapshot.receive_address)
         self.revision.set(self.revision.get() + 1)

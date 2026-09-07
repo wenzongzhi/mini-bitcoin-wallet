@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from .models import BitcoinAmount, DisplayUnit, SendPreview, WalletCreation, WalletSnapshot
+from .models import (
+    BitcoinAmount,
+    DisplayUnit,
+    SendPreview,
+    WalletCreation,
+    WalletSnapshot,
+    WalletSummary,
+)
 from .ports import WalletService
 
 
@@ -14,6 +21,15 @@ class WalletApplication:
 
     def load_wallet(self) -> WalletSnapshot:
         return self._service.snapshot()
+
+    def list_wallets(self) -> tuple[WalletSummary, ...]:
+        return self._service.list_wallets()
+
+    def select_wallet(self, name: str) -> WalletSnapshot:
+        normalized = name.strip()
+        if not normalized:
+            raise ValueError("Wallet name cannot be empty.")
+        return self._service.select_wallet(normalized)
 
     def rename_wallet(self, name: str) -> WalletSnapshot:
         normalized = name.strip()

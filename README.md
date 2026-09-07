@@ -33,6 +33,8 @@ application use case, UI state, then page or widget.
 - Without a wallet, Home shows zero balance and no history; Deposit hides its
   address and QR code.
 - Wallet creation and BIP39 import require a wallet name and password.
+- Multiple wallets can be listed and switched without entering a password. The
+  active wallet for each network is remembered in non-secret `settings.json`.
 - Imported wallets scan 20 receive and 20 change addresses. The next unused
   receive address is displayed after synchronization.
 - Balance and history include both receive and change addresses.
@@ -77,12 +79,14 @@ mini-bitcoin-wallet/
 ├── app-testnet4.py
 ├── build_mainnet.py
 ├── build_testnet4.py
+├── app_settings.py
 ├── adapters/
 ├── icon/
 ├── btc/
 ├── network/
 ├── wallet/
 ├── wallet_core/
+├── wallet_manager.py
 ├── tests/
 ├── requirements.txt
 └── README.md

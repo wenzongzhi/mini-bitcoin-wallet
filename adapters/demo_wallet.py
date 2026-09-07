@@ -10,6 +10,7 @@ from wallet_core.models import (
     TransactionSummary,
     WalletCreation,
     WalletSnapshot,
+    WalletSummary,
 )
 from wallet_core.ports import WalletService
 
@@ -55,6 +56,20 @@ class DemoWalletService(WalletService):
         )
 
     def snapshot(self) -> WalletSnapshot:
+        return self._snapshot
+
+    def list_wallets(self) -> tuple[WalletSummary, ...]:
+        return (
+            WalletSummary(
+                name=self._snapshot.name,
+                network=self._snapshot.network,
+                encrypted=True,
+            ),
+        )
+
+    def select_wallet(self, name: str) -> WalletSnapshot:
+        if name != self._snapshot.name:
+            raise ValueError(f'Wallet "{name}" does not exist.')
         return self._snapshot
 
     def rename_wallet(self, name: str) -> WalletSnapshot:

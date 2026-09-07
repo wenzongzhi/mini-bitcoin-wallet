@@ -29,8 +29,10 @@ from wallet_core.models import (
     TransactionSummary,
     WalletCreation,
     WalletSnapshot,
+    WalletSummary,
 )
 from wallet_core.ports import WalletService
+from app_settings import ApplicationSettingsStore
 
 
 class BitcoinToolWalletService(WalletService):
@@ -50,6 +52,7 @@ class BitcoinToolWalletService(WalletService):
         cache_file: Path,
         network: str = NETWORK_MAINNET,
         backend_factory: Callable[[str], EsploraBackend] | None = None,
+        settings_file: Path | None = None,
     ):
         # Validate once at the composition boundary, including when no wallet
         # file exists yet.
@@ -57,29 +60,76 @@ class BitcoinToolWalletService(WalletService):
         self.wallet_file = Path(wallet_file)
         self.cache_file = Path(cache_file)
         self.network = network
+        self.settings = ApplicationSettingsStore(
+            settings_file or self.wallet_file.parent / "settings.json"
+        )
+        self.settings.ensure_exists()
         self._backend_factory = backend_factory or (
             lambda selected_network: EsploraBackend(network=selected_network)
         )
-        self._wallet_name = self._discover_wallet_name()
+        self._wallet_name = self._resolve_active_wallet()
 
-    def _discover_wallet_name(self) -> str | None:
+    def _read_wallet_records(self) -> dict:
+        """Read public wallet metadata without decrypting secret material."""
+
         try:
             with self.wallet_file.open("r", encoding="utf-8") as file:
                 wallets = json.load(file)
         except FileNotFoundError:
-            return None
+            return {}
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f'Cannot read wallet file "{self.wallet_file}": {exc}') from exc
         if not isinstance(wallets, dict):
             raise ValueError(f'Invalid wallet file "{self.wallet_file}".')
-        # The desktop UI currently operates on one wallet. The newest appended
-        # entry remains selected after a restart when a file contains several.
-        return next(reversed(wallets), None) if wallets else None
+        return wallets
+
+    def list_wallets(self) -> tuple[WalletSummary, ...]:
+        summaries = []
+        for name, wallet in self._read_wallet_records().items():
+            if not isinstance(name, str) or not isinstance(wallet, dict):
+                raise ValueError(f'Invalid wallet file "{self.wallet_file}".')
+            if wallet.get("network") != self.network:
+                continue
+            encrypted = wallet.get("encrypted")
+            if not isinstance(encrypted, bool):
+                raise ValueError(f'Invalid wallet metadata for "{name}".')
+            fingerprint = wallet.get("master_fingerprint")
+            if not isinstance(fingerprint, str):
+                fingerprint = None
+            summaries.append(
+                WalletSummary(
+                    name=name,
+                    network=self.network,
+                    encrypted=encrypted,
+                    master_fingerprint=fingerprint,
+                )
+            )
+        return tuple(summaries)
+
+    def _resolve_active_wallet(self) -> str | None:
+        wallets = self.list_wallets()
+        wallet_names = {wallet.name for wallet in wallets}
+        configured_name = self.settings.active_wallet(self.network)
+        selected_name = (
+            configured_name
+            if configured_name in wallet_names
+            else wallets[0].name if wallets else None
+        )
+        if selected_name != configured_name:
+            self.settings.set_active_wallet(self.network, selected_name)
+        return selected_name
+
+    def select_wallet(self, name: str) -> WalletSnapshot:
+        if name not in {wallet.name for wallet in self.list_wallets()}:
+            raise ValueError(f'Wallet "{name}" does not exist on {self.network}.')
+        self._wallet_name = name
+        self.settings.set_active_wallet(self.network, name)
+        return self.snapshot()
 
     def snapshot(self) -> WalletSnapshot:
         if self._wallet_name is None:
             return WalletSnapshot(
-                name="Bitcoin Wallet",
+                name="No Wallet",
                 balance=BitcoinAmount(0),
                 receive_address="",
                 network=self.network,
@@ -324,6 +374,7 @@ class BitcoinToolWalletService(WalletService):
                 network=self.network,
             )
             self._wallet_name = name
+            self.settings.set_active_wallet(self.network, name)
             if imported:
                 self._scan_imported_wallet()
         except (WalletError, EsploraError) as exc:

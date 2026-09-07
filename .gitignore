@@ -12,3 +12,5 @@ build/
 /wallets_testnet4.json.lock
 /wallet_cache_testnet4.json
 /wallet_cache_testnet4.json.lock
+/settings.json
+/settings.json.lock

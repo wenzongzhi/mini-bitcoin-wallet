@@ -80,6 +80,16 @@ class TransactionSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class WalletSummary:
+    """Non-secret metadata used to list wallets without unlocking them."""
+
+    name: str
+    network: str
+    encrypted: bool
+    master_fingerprint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class WalletSnapshot:
     name: str
     balance: BitcoinAmount
