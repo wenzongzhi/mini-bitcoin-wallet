@@ -1,0 +1,11 @@
+Pillow>=10.0
+qrcode>=7.4,<9
+bech32
+bip32
+cryptography
+coincurve
+ecdsa
+filelock
+mnemonic
+platformdirs
+PyInstaller

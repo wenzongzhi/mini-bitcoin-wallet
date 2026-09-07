@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+build/
+/wallets.json
+/wallets.json.lock
+/wallet_cache.json
+/wallet_cache.json.lock
+/wallets_testnet4.json
+/wallets_testnet4.json.lock
+/wallet_cache_testnet4.json
+/wallet_cache_testnet4.json.lock
