@@ -13,6 +13,7 @@ from wallet_core import (
     WalletApplication,
     WalletCreation,
     WalletSummary,
+    WithdrawalDraft,
     WithdrawalReview,
     BroadcastResult,
 )
@@ -20,6 +21,7 @@ from wallet_core import (
 
 class WalletUIState:
     def __init__(self, root: tk.Misc, application: WalletApplication):
+        self.root = root
         self.application = application
         self._snapshot = application.load_wallet()
         self._wallets = application.list_wallets()
@@ -33,11 +35,34 @@ class WalletUIState:
         self.custom_fee = tk.BooleanVar(root, value=False)
         self.fiat_currency = tk.StringVar(root, value="USD")
         self.dark_mode = tk.BooleanVar(root, value=False)
+        self.sync_status = tk.StringVar(root, value="")
+        self.syncing = tk.BooleanVar(root, value=False)
         self.revision = tk.IntVar(root, value=0)
 
     @property
     def transactions(self):
         return self._snapshot.transactions
+
+    @property
+    def synced_at(self):
+        return self._snapshot.synced_at
+
+    @property
+    def monitored_transaction_ids(self) -> tuple[str, ...]:
+        """Return pending and unconfirmed TXIDs without duplicates."""
+
+        return tuple(
+            dict.fromkeys(
+                (
+                    *self._snapshot.pending_txids,
+                    *(
+                        transaction.txid
+                        for transaction in self._snapshot.transactions
+                        if not transaction.confirmed
+                    ),
+                )
+            )
+        )
 
     @property
     def wallets(self) -> tuple[WalletSummary, ...]:
@@ -78,6 +103,7 @@ class WalletUIState:
     ) -> WalletCreation:
         creation = self.application.create_wallet(name, password, mnemonic)
         self._apply_snapshot(creation.snapshot)
+        self._announce("<<ActiveWalletChanged>>")
         return creation
 
     def select_wallet(self, name: str) -> None:
@@ -86,11 +112,13 @@ class WalletUIState:
         self.address.set("")
         self.send_all.set(False)
         self._apply_snapshot(snapshot)
+        self._announce("<<ActiveWalletChanged>>")
 
     def apply_wallet_creation(self, creation: WalletCreation) -> None:
         """Apply a wallet created by a background application use case."""
 
         self._apply_snapshot(creation.snapshot)
+        self._announce("<<ActiveWalletChanged>>")
 
     def reload_wallet(self) -> None:
         """Reload persistent state after a partially completed operation."""
@@ -103,6 +131,24 @@ class WalletUIState:
         self.wallet_name.set(snapshot.name)
         self.receive_address.set(snapshot.receive_address)
         self.revision.set(self.revision.get() + 1)
+
+    def apply_synchronized_snapshot(self, snapshot) -> bool:
+        """Apply a background result only if its wallet is still active."""
+
+        if snapshot.name != self.active_wallet_name:
+            return False
+        self._apply_snapshot(snapshot)
+        return True
+
+    def request_wallet_refresh(self) -> None:
+        self._announce("<<WalletRefreshRequested>>")
+
+    def set_sync_activity(self, active: bool, message: str) -> None:
+        self.syncing.set(active)
+        self.sync_status.set(message)
+
+    def _announce(self, event_name: str) -> None:
+        self.root.event_generate(event_name, when="tail")
 
     def amount_is_valid(self) -> bool:
         if self.send_all.get():
@@ -124,17 +170,19 @@ class WalletUIState:
             send_all=self.send_all.get(),
         )
 
-    def prepare_withdrawal(
-        self, fee_rate_sat_vb: int, password: str | None
-    ) -> WithdrawalReview:
+    def prepare_withdrawal(self, fee_rate_sat_vb: int) -> WithdrawalDraft:
         return self.application.prepare_withdrawal(
             self.address.get(),
             self.amount.get(),
             self.unit,
             fee_rate_sat_vb,
-            password,
             send_all=self.send_all.get(),
         )
+
+    def sign_withdrawal(
+        self, draft_id: str, password: str | None
+    ) -> WithdrawalReview:
+        return self.application.sign_withdrawal(draft_id, password)
 
     def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:
         result = self.application.broadcast_withdrawal(review_id)
@@ -151,6 +199,7 @@ class WalletUIState:
         self.address.set("")
         self.send_all.set(False)
         self.reload_wallet()
+        self._announce("<<WalletBroadcast>>")
 
     def fiat_zero_text(self) -> str:
         return {

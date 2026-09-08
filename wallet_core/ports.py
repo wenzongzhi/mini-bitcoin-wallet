@@ -8,9 +8,11 @@ from .models import (
     BitcoinAmount,
     BroadcastResult,
     SendPreview,
+    TransactionStatus,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
+    WithdrawalDraft,
     WithdrawalReview,
 )
 
@@ -33,6 +35,14 @@ class WalletService(ABC):
     @abstractmethod
     def select_wallet(self, name: str) -> WalletSnapshot:
         """Persist and load the active wallet without decrypting it."""
+
+    @abstractmethod
+    def synchronize_wallet(self, name: str) -> WalletSnapshot:
+        """Run a complete network synchronization for one named wallet."""
+
+    @abstractmethod
+    def transaction_status(self, txid: str) -> TransactionStatus:
+        """Fetch one transaction's confirmation status without scanning addresses."""
 
     @abstractmethod
     def rename_wallet(self, name: str) -> WalletSnapshot:
@@ -61,11 +71,16 @@ class WalletService(ABC):
         destination: str,
         amount: BitcoinAmount | None,
         fee_rate_sat_vb: int,
-        password: str | None,
         *,
         send_all: bool = False,
+    ) -> WithdrawalDraft:
+        """Synchronize and fund a transaction before requesting a password."""
+
+    @abstractmethod
+    def sign_withdrawal(
+        self, draft_id: str, password: str | None
     ) -> WithdrawalReview:
-        """Synchronize, fund, and sign a transaction for user review."""
+        """Unlock the wallet and sign a previously validated draft."""
 
     @abstractmethod
     def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:

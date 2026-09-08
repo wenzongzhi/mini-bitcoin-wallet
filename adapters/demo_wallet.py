@@ -8,10 +8,12 @@ from wallet_core.models import (
     BroadcastResult,
     SendPreview,
     TransactionDirection,
+    TransactionStatus,
     TransactionSummary,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
+    WithdrawalDraft,
     WithdrawalReview,
 )
 from wallet_core.ports import WalletService
@@ -23,6 +25,7 @@ class DemoWalletService(WalletService):
     ESTIMATED_TRANSACTION_VBYTES = 140
 
     def __init__(self) -> None:
+        self._demo_draft = None
         self._snapshot = WalletSnapshot(
             name="Bitcoin Wallet",
             balance=BitcoinAmount(408_000),
@@ -74,6 +77,12 @@ class DemoWalletService(WalletService):
             raise ValueError(f'Wallet "{name}" does not exist.')
         return self._snapshot
 
+    def synchronize_wallet(self, name: str) -> WalletSnapshot:
+        return self.select_wallet(name)
+
+    def transaction_status(self, txid: str) -> TransactionStatus:
+        return TransactionStatus(txid=txid, confirmed=True, block_height=1)
+
     def rename_wallet(self, name: str) -> WalletSnapshot:
         self._snapshot = replace(self._snapshot, name=name)
         return self._snapshot
@@ -113,25 +122,42 @@ class DemoWalletService(WalletService):
         destination: str,
         amount: BitcoinAmount | None,
         fee_rate_sat_vb: int,
-        password: str | None,
         *,
         send_all: bool = False,
-    ) -> WithdrawalReview:
+    ) -> WithdrawalDraft:
         preview = self.preview_send(
             destination,
             amount,
             fee_rate_sat_vb,
             send_all=send_all,
         )
+        self._demo_draft = (preview, send_all)
+        return WithdrawalDraft(
+            draft_id="demo-review",
+            wallet_name=self._snapshot.name,
+            network=self._snapshot.network,
+            destination=destination,
+            amount=preview.amount,
+            estimated_fee=preview.fee,
+            fee_rate_sat_vb=fee_rate_sat_vb,
+            send_all=send_all,
+        )
+
+    def sign_withdrawal(
+        self, draft_id: str, password: str | None
+    ) -> WithdrawalReview:
+        if draft_id != "demo-review" or self._demo_draft is None:
+            raise ValueError("Withdrawal draft does not exist.")
+        preview, send_all = self._demo_draft
         return WithdrawalReview(
-            review_id="demo-review",
+            review_id=draft_id,
             wallet_name=self._snapshot.name,
             network=self._snapshot.network,
             txid="0" * 64,
-            destination=destination,
+            destination=preview.destination,
             amount=preview.amount,
             fee=preview.fee,
-            fee_rate_sat_vb=fee_rate_sat_vb,
+            fee_rate_sat_vb=preview.fee_rate_sat_vb,
             send_all=send_all,
         )
 
@@ -141,4 +167,6 @@ class DemoWalletService(WalletService):
         return BroadcastResult("0" * 64, "")
 
     def cancel_withdrawal(self, review_id: str) -> None:
+        if review_id == "demo-review":
+            self._demo_draft = None
         return None

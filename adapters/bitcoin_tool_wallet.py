@@ -6,6 +6,7 @@ import json
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import RLock
 from typing import Callable
 
 from btc.chainparams import NETWORK_MAINNET, get_chain_params
@@ -40,14 +41,17 @@ from wallet_core.models import (
     BroadcastResult,
     SendPreview,
     TransactionDirection,
+    TransactionStatus,
     TransactionSummary,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
+    WithdrawalDraft,
     WithdrawalReview,
 )
 from wallet_core.ports import WalletService
 from app_settings import ApplicationSettingsStore
+from .wallet_esplora_backend import WalletEsploraBackend
 
 
 class BitcoinToolWalletService(WalletService):
@@ -80,8 +84,10 @@ class BitcoinToolWalletService(WalletService):
         )
         self.settings.ensure_exists()
         self._backend_factory = backend_factory or (
-            lambda selected_network: EsploraBackend(network=selected_network)
+            lambda selected_network: WalletEsploraBackend(network=selected_network)
         )
+        self._operation_lock = RLock()
+        self._funded_withdrawals: dict[str, dict] = {}
         self._prepared_withdrawals: dict[str, dict] = {}
         self._wallet_name = self._resolve_active_wallet()
 
@@ -142,6 +148,53 @@ class BitcoinToolWalletService(WalletService):
         self.settings.set_active_wallet(self.network, name)
         return self.snapshot()
 
+    def synchronize_wallet(self, name: str) -> WalletSnapshot:
+        """Synchronize one wallet without changing the user's active selection."""
+
+        if name not in {wallet.name for wallet in self.list_wallets()}:
+            raise ValueError(f'Wallet "{name}" does not exist on {self.network}.')
+        with self._operation_lock:
+            try:
+                sync_wallet(
+                    name,
+                    wallet_file=self.wallet_file,
+                    cache_file=self.cache_file,
+                    backend=self._backend_factory(self.network),
+                    include_transactions=True,
+                    network=self.network,
+                )
+                return self._snapshot_for(name)
+            except (WalletError, EsploraError) as exc:
+                raise ValueError(str(exc)) from exc
+
+    def transaction_status(self, txid: str) -> TransactionStatus:
+        """Fetch only one TXID status instead of rescanning every address."""
+
+        backend = self._backend_factory(self.network)
+        try:
+            status = backend.get_transaction_status(txid)
+        except (AttributeError, EsploraError) as exc:
+            raise ValueError(str(exc)) from exc
+        confirmed = status.get("confirmed")
+        if not isinstance(confirmed, bool):
+            raise ValueError("Backend returned an invalid transaction status.")
+        block_height = status.get("block_height")
+        if isinstance(block_height, bool) or not isinstance(block_height, int):
+            block_height = None
+        block_timestamp = status.get("block_time")
+        block_time = None
+        if isinstance(block_timestamp, int) and not isinstance(block_timestamp, bool):
+            try:
+                block_time = datetime.fromtimestamp(block_timestamp, timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                block_time = None
+        return TransactionStatus(
+            txid=txid,
+            confirmed=confirmed,
+            block_height=block_height,
+            block_time=block_time,
+        )
+
     def snapshot(self) -> WalletSnapshot:
         if self._wallet_name is None:
             return WalletSnapshot(
@@ -152,24 +205,30 @@ class BitcoinToolWalletService(WalletService):
                 transactions=(),
                 is_initialized=False,
             )
+        return self._snapshot_for(self._wallet_name)
+
+    def _snapshot_for(self, wallet_name: str) -> WalletSnapshot:
         try:
-            address = self._current_receive_address()
-            balance = self._cached_balance()
-            transactions = self._cached_transactions()
+            address = self._current_receive_address(wallet_name)
+            balance = self._cached_balance(wallet_name)
+            transactions = self._cached_transactions(wallet_name)
+            synced_at, pending_txids = self._cached_sync_metadata(wallet_name)
         except WalletError as exc:
             raise ValueError(str(exc)) from exc
         return WalletSnapshot(
-            name=self._wallet_name,
+            name=wallet_name,
             balance=BitcoinAmount(balance),
             receive_address=address,
             network=self.network,
             transactions=transactions,
             is_initialized=True,
+            synced_at=synced_at,
+            pending_txids=pending_txids,
         )
 
-    def _current_receive_address(self) -> str:
+    def _current_receive_address(self, wallet_name: str) -> str:
         address_book = get_wallet_address_book(
-            self._wallet_name,
+            wallet_name,
             wallet_file=self.wallet_file,
             address_type=self.ADDRESS_TYPE,
             network=self.network,
@@ -179,7 +238,7 @@ class BitcoinToolWalletService(WalletService):
         ]
         if not receive_entries:
             result = get_new_address(
-                self._wallet_name,
+                wallet_name,
                 wallet_file=self.wallet_file,
                 address_type=self.ADDRESS_TYPE,
                 network=self.network,
@@ -189,7 +248,7 @@ class BitcoinToolWalletService(WalletService):
         # Imported wallets pre-issue a discovery pool. The receive address is
         # the first address after the highest used index, not the last address
         # in that pool. With no activity this deliberately resolves to index 0.
-        target_index = self._next_receive_index_from_cache()
+        target_index = self._next_receive_index_from_cache(wallet_name)
         matching_entry = next(
             (entry for entry in receive_entries if entry.get("index") == target_index),
             None,
@@ -198,7 +257,7 @@ class BitcoinToolWalletService(WalletService):
             return matching_entry["address"]
         while max(entry["index"] for entry in receive_entries) < target_index:
             result = get_new_address(
-                self._wallet_name,
+                wallet_name,
                 wallet_file=self.wallet_file,
                 address_type=self.ADDRESS_TYPE,
                 network=self.network,
@@ -207,11 +266,11 @@ class BitcoinToolWalletService(WalletService):
                 return result["address"]
         raise WalletError("cannot resolve the next receive address")
 
-    def _next_receive_index_from_cache(self) -> int:
+    def _next_receive_index_from_cache(self, wallet_name: str) -> int:
         if not self.cache_file.exists():
             return 0
         try:
-            wallet_cache = read_wallet_cache_entry(self._wallet_name, self.cache_file)
+            wallet_cache = read_wallet_cache_entry(wallet_name, self.cache_file)
         except WalletError as exc:
             if "has no synced cache" in str(exc):
                 return 0
@@ -264,12 +323,12 @@ class BitcoinToolWalletService(WalletService):
             network=self.network,
         )
 
-    def _cached_balance(self) -> int:
+    def _cached_balance(self, wallet_name: str) -> int:
         if not self.cache_file.exists():
             return 0
         try:
             result = get_cached_balance(
-                self._wallet_name,
+                wallet_name,
                 cache_file=self.cache_file,
                 network=self.network,
             )
@@ -282,12 +341,12 @@ class BitcoinToolWalletService(WalletService):
             raise WalletError("wallet cache total balance is invalid")
         return total
 
-    def _cached_transactions(self) -> tuple[TransactionSummary, ...]:
+    def _cached_transactions(self, wallet_name: str) -> tuple[TransactionSummary, ...]:
         if not self.cache_file.exists():
             return ()
         try:
             result = list_cached_transactions(
-                self._wallet_name,
+                wallet_name,
                 cache_file=self.cache_file,
                 network=self.network,
             )
@@ -353,6 +412,42 @@ class BitcoinToolWalletService(WalletService):
             )
         return tuple(summaries)
 
+    def _cached_sync_metadata(
+        self, wallet_name: str
+    ) -> tuple[datetime | None, tuple[str, ...]]:
+        if not self.cache_file.exists():
+            return None, ()
+        try:
+            wallet_cache = read_wallet_cache_entry(wallet_name, self.cache_file)
+        except WalletError as exc:
+            if "has no synced cache" in str(exc):
+                return None, ()
+            raise
+        synced_at = self._parse_cached_datetime(wallet_cache.get("synced_at"))
+        pending = wallet_cache.get("pending_transactions", [])
+        if not isinstance(pending, list):
+            return synced_at, ()
+        pending_txids = tuple(
+            item["txid"]
+            for item in pending
+            if isinstance(item, dict)
+            and isinstance(item.get("txid"), str)
+            and len(item["txid"]) == 64
+        )
+        return synced_at, pending_txids
+
+    @staticmethod
+    def _parse_cached_datetime(value) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+
     @staticmethod
     def _non_negative_sats(value) -> int:
         return (
@@ -376,6 +471,12 @@ class BitcoinToolWalletService(WalletService):
         return f"{prefix}/{txid}"
 
     def create_wallet(
+        self, name: str, password: str, mnemonic: str | None = None
+    ) -> WalletCreation:
+        with self._operation_lock:
+            return self._create_wallet(name, password, mnemonic)
+
+    def _create_wallet(
         self, name: str, password: str, mnemonic: str | None = None
     ) -> WalletCreation:
         imported = mnemonic is not None
@@ -420,11 +521,26 @@ class BitcoinToolWalletService(WalletService):
         destination: str,
         amount: BitcoinAmount | None,
         fee_rate_sat_vb: int,
-        password: str | None,
         *,
         send_all: bool = False,
-    ) -> WithdrawalReview:
-        """Synchronize and sign using the same workflow as sendtoaddress/sendall."""
+    ) -> WithdrawalDraft:
+        with self._operation_lock:
+            return self._prepare_withdrawal(
+                destination,
+                amount,
+                fee_rate_sat_vb,
+                send_all=send_all,
+            )
+
+    def _prepare_withdrawal(
+        self,
+        destination: str,
+        amount: BitcoinAmount | None,
+        fee_rate_sat_vb: int,
+        *,
+        send_all: bool = False,
+    ) -> WithdrawalDraft:
+        """Validate, synchronize, and fund before asking for wallet secrets."""
 
         if self._wallet_name is None:
             raise ValueError("Create or import a wallet before sending Bitcoin.")
@@ -432,6 +548,12 @@ class BitcoinToolWalletService(WalletService):
         backend = self._backend_factory(self.network)
         funded = None
         try:
+            # Validate the network/address locally before making network calls.
+            create_raw_transaction(
+                [],
+                [{"address": destination, "amount_sats": 1}],
+                self.network,
+            )
             sync_wallet(
                 wallet_name,
                 wallet_file=self.wallet_file,
@@ -468,14 +590,6 @@ class BitcoinToolWalletService(WalletService):
                     fee_rate_sat_vb,
                     utxo_source="fresh backend synchronization",
                 )
-            signed = sign_funded_transaction(
-                funded,
-                wallet_name,
-                password,
-                self.wallet_file,
-                self.cache_file,
-                self.network,
-            )
         except (TransactionError, WalletError, EsploraError) as exc:
             if funded is not None:
                 self._release_withdrawal_reservations(
@@ -483,26 +597,82 @@ class BitcoinToolWalletService(WalletService):
                 )
             raise ValueError(str(exc)) from exc
 
-        review_id = signed["draft_id"]
-        self._prepared_withdrawals[review_id] = signed
+        draft_id = funded["draft_id"]
+        destination_sats = sum(
+            output["value"]
+            for output in funded["outputs"]
+            if output.get("is_change") is False
+        )
+        self._funded_withdrawals[draft_id] = {
+            "document": funded,
+            "destination": destination,
+            "fee_rate_sat_vb": fee_rate_sat_vb,
+            "send_all": send_all,
+        }
+        return WithdrawalDraft(
+            draft_id=draft_id,
+            wallet_name=wallet_name,
+            network=self.network,
+            destination=destination,
+            amount=BitcoinAmount(destination_sats),
+            estimated_fee=BitcoinAmount(funded["estimated_fee_sats"]),
+            fee_rate_sat_vb=fee_rate_sat_vb,
+            send_all=send_all,
+        )
+
+    def sign_withdrawal(
+        self, draft_id: str, password: str | None
+    ) -> WithdrawalReview:
+        with self._operation_lock:
+            return self._sign_withdrawal(draft_id, password)
+
+    def _sign_withdrawal(
+        self, draft_id: str, password: str | None
+    ) -> WithdrawalReview:
+        prepared = self._funded_withdrawals.get(draft_id)
+        if prepared is None:
+            raise ValueError("Withdrawal draft has expired or does not exist.")
+        funded = prepared["document"]
+        try:
+            signed = sign_funded_transaction(
+                funded,
+                funded["wallet_name"],
+                password,
+                self.wallet_file,
+                self.cache_file,
+                self.network,
+            )
+        except (TransactionError, WalletError) as exc:
+            self._funded_withdrawals.pop(draft_id, None)
+            self._release_withdrawal_reservations(
+                funded["wallet_name"], draft_id
+            )
+            raise ValueError(str(exc)) from exc
+
+        self._funded_withdrawals.pop(draft_id, None)
+        self._prepared_withdrawals[draft_id] = signed
         destination_sats = sum(
             output["value"]
             for output in signed["outputs"]
             if output.get("is_change") is False
         )
         return WithdrawalReview(
-            review_id=review_id,
-            wallet_name=wallet_name,
+            review_id=draft_id,
+            wallet_name=signed["wallet_name"],
             network=self.network,
             txid=signed["txid"],
-            destination=destination,
+            destination=prepared["destination"],
             amount=BitcoinAmount(destination_sats),
             fee=BitcoinAmount(signed["fee_sats"]),
-            fee_rate_sat_vb=fee_rate_sat_vb,
-            send_all=send_all,
+            fee_rate_sat_vb=prepared["fee_rate_sat_vb"],
+            send_all=prepared["send_all"],
         )
 
     def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:
+        with self._operation_lock:
+            return self._broadcast_withdrawal(review_id)
+
+    def _broadcast_withdrawal(self, review_id: str) -> BroadcastResult:
         signed = self._prepared_withdrawals.get(review_id)
         if signed is None:
             raise ValueError("Withdrawal review has expired or does not exist.")
@@ -518,29 +688,19 @@ class BitcoinToolWalletService(WalletService):
             raise ValueError(str(exc)) from exc
 
         self._prepared_withdrawals.pop(review_id, None)
-        warning = result.get("cache_warning")
-        try:
-            sync_wallet(
-                signed["wallet_name"],
-                wallet_file=self.wallet_file,
-                cache_file=self.cache_file,
-                backend=backend,
-                include_transactions=True,
-                network=self.network,
-            )
-        except (WalletError, EsploraError) as exc:
-            warning = warning or f"Broadcast succeeded, but wallet refresh failed: {exc}"
         return BroadcastResult(
             txid=result["txid"],
             explorer_url=self._transaction_explorer_url(result["txid"]),
-            cache_warning=warning,
+            cache_warning=result.get("cache_warning"),
         )
 
     def cancel_withdrawal(self, review_id: str) -> None:
+        funded = self._funded_withdrawals.pop(review_id, None)
         signed = self._prepared_withdrawals.pop(review_id, None)
-        if signed is not None:
+        document = signed or (funded["document"] if funded is not None else None)
+        if document is not None:
             self._release_withdrawal_reservations(
-                signed["wallet_name"], signed["draft_id"]
+                document["wallet_name"], document["draft_id"]
             )
 
     def _release_withdrawal_reservations(

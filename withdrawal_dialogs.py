@@ -11,7 +11,7 @@ from typing import Callable
 from app_assets import apply_window_icon
 from state import WalletUIState
 from theme import Theme
-from wallet_core import BroadcastResult, WithdrawalReview
+from wallet_core import BroadcastResult, WithdrawalDraft, WithdrawalReview
 
 
 def _run_with_progress(
@@ -87,41 +87,65 @@ def review_withdrawal(
             parent=parent,
         )
         return
-    password = None
-    if state.active_wallet_encrypted:
-        password = simpledialog.askstring(
-            "Unlock Wallet",
-            f'Enter the password for "{state.active_wallet_name}":',
-            show="*",
-            parent=parent,
-        )
-        if password is None:
-            return
-
     # Tk variables are read only on the UI thread; the worker receives values.
     destination = state.address.get()
     amount_text = state.amount.get()
     unit = state.unit
     send_all = state.send_all.get()
 
-    def prepare() -> WithdrawalReview:
+    def prepare() -> WithdrawalDraft:
         return state.application.prepare_withdrawal(
             destination,
             amount_text,
             unit,
             fee_rate_sat_vb,
-            password,
             send_all=send_all,
         )
 
     _run_with_progress(
         parent,
         title="Prepare Withdrawal",
-        message="Synchronizing wallet and signing transaction…",
+        message="Validating address, balance, and transaction fee…",
         operation=prepare,
-        on_success=lambda result: _confirm_withdrawal(parent, theme, state, result),
+        on_success=lambda draft: _request_signature(parent, theme, state, draft),
         on_error=lambda error: messagebox.showerror(
             "Cannot Review Withdrawal", str(error), parent=parent
+        ),
+    )
+
+
+def _request_signature(
+    parent: tk.Misc,
+    theme: Theme,
+    state: WalletUIState,
+    draft: WithdrawalDraft,
+) -> None:
+    """Ask for a password only after address, balance, and fee validation."""
+
+    password = None
+    if state.active_wallet_encrypted:
+        password = simpledialog.askstring(
+            "Unlock Wallet",
+            f'Enter the password for "{draft.wallet_name}":',
+            show="*",
+            parent=parent,
+        )
+        if password is None:
+            state.cancel_withdrawal(draft.draft_id)
+            return
+
+    _run_with_progress(
+        parent,
+        title="Sign Withdrawal",
+        message="Signing the validated transaction…",
+        operation=lambda: state.application.sign_withdrawal(
+            draft.draft_id, password
+        ),
+        on_success=lambda review: _confirm_withdrawal(
+            parent, theme, state, review
+        ),
+        on_error=lambda error: messagebox.showerror(
+            "Cannot Sign Withdrawal", str(error), parent=parent
         ),
     )
 

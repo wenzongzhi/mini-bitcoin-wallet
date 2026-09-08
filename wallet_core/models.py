@@ -97,6 +97,8 @@ class WalletSnapshot:
     network: str = "mainnet"
     transactions: tuple[TransactionSummary, ...] = ()
     is_initialized: bool = True
+    synced_at: datetime | None = None
+    pending_txids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +118,20 @@ class SendPreview:
     @property
     def total(self) -> BitcoinAmount:
         return BitcoinAmount(self.amount.sats + self.fee.sats)
+
+
+@dataclass(frozen=True, slots=True)
+class WithdrawalDraft:
+    """Funded transaction values validated before the wallet is unlocked."""
+
+    draft_id: str
+    wallet_name: str
+    network: str
+    destination: str
+    amount: BitcoinAmount
+    estimated_fee: BitcoinAmount
+    fee_rate_sat_vb: int
+    send_all: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,3 +160,13 @@ class BroadcastResult:
     txid: str
     explorer_url: str
     cache_warning: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionStatus:
+    """Lightweight Esplora status used without rescanning wallet addresses."""
+
+    txid: str
+    confirmed: bool
+    block_height: int | None = None
+    block_time: datetime | None = None

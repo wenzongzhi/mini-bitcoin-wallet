@@ -14,11 +14,18 @@ from wallet import get_new_address, get_wallet_address_book
 class FakeEsploraBackend:
     """Deterministic backend for address-discovery integration tests."""
 
-    def __init__(self, network="mainnet", funded_ordinals=None):
+    def __init__(
+        self,
+        network="mainnet",
+        funded_ordinals=None,
+        transaction_confirmed=False,
+    ):
         self.network = network
         self.base_url = "https://example.invalid/api"
         self.funded_ordinals = funded_ordinals or {}
         self._address_ordinals = {}
+        self.transaction_query_count = 0
+        self.transaction_confirmed = transaction_confirmed
 
     def verify_network(self):
         return None
@@ -61,6 +68,7 @@ class FakeEsploraBackend:
         ]
 
     def get_address_transactions(self, address):
+        self.transaction_query_count += 1
         ordinal = self._ordinal(address)
         amount = self.funded_ordinals.get(ordinal, 0)
         if not amount:
@@ -84,6 +92,16 @@ class FakeEsploraBackend:
 
         transaction = deserialize_transaction_hex(raw_tx_hex)
         return transaction_txid(transaction)
+
+    def get_transaction_status(self, txid):
+        return {
+            "confirmed": self.transaction_confirmed,
+            **(
+                {"block_height": 101, "block_time": 1_700_000_100}
+                if self.transaction_confirmed
+                else {}
+            ),
+        }
 
 
 class BitcoinAmountTests(TestCase):
@@ -141,7 +159,7 @@ class WalletApplicationTests(TestCase):
     def test_rejects_zero_fee_before_transaction_preparation(self):
         with self.assertRaisesRegex(ValueError, "Zero-fee"):
             self.application.prepare_withdrawal(
-                "bc1qdestination", "0.001", DisplayUnit.BTC, 0, None
+                "bc1qdestination", "0.001", DisplayUnit.BTC, 0
             )
 
 
@@ -363,9 +381,13 @@ class BitcoinToolWalletServiceTests(TestCase):
         )
 
     def test_selected_wallet_prepares_and_broadcasts_withdrawal(self):
-        funded_backend = lambda network: FakeEsploraBackend(
-            network, funded_ordinals={0: 100_000}
-        )
+        backends = []
+
+        def funded_backend(network):
+            backend = FakeEsploraBackend(network, funded_ordinals={0: 100_000})
+            backends.append(backend)
+            return backend
+
         service = BitcoinToolWalletService(
             self.wallet_file,
             self.wallet_file.parent / "send-cache.json",
@@ -378,12 +400,12 @@ class BitcoinToolWalletServiceTests(TestCase):
             "Wallet_B", wallet_file=self.wallet_file, network="mainnet"
         )["address"]
 
-        review = service.prepare_withdrawal(
+        draft = service.prepare_withdrawal(
             destination,
             BitcoinAmount(25_000),
             2,
-            "password-b",
         )
+        review = service.sign_withdrawal(draft.draft_id, "password-b")
 
         self.assertEqual(review.wallet_name, "Wallet_B")
         self.assertEqual(review.amount.sats, 25_000)
@@ -391,6 +413,51 @@ class BitcoinToolWalletServiceTests(TestCase):
         result = service.broadcast_withdrawal(review.review_id)
         self.assertEqual(result.txid, review.txid)
         self.assertEqual(result.explorer_url, f"https://mempool.space/tx/{review.txid}")
+        self.assertEqual(sum(item.transaction_query_count for item in backends), 0)
+        self.assertEqual(service.snapshot().pending_txids, (review.txid,))
+
+    def test_full_sync_and_lightweight_transaction_status_are_separate(self):
+        backend = FakeEsploraBackend(
+            funded_ordinals={0: 12_345}, transaction_confirmed=True
+        )
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "sync-cache.json",
+            backend_factory=lambda _network: backend,
+        )
+        service.create_wallet("SyncWallet", "password")
+
+        snapshot = service.synchronize_wallet("SyncWallet")
+        status = service.transaction_status("ab" * 32)
+
+        self.assertEqual(snapshot.balance.sats, 12_345)
+        self.assertIsNotNone(snapshot.synced_at)
+        self.assertEqual(backend.transaction_query_count, 1)
+        self.assertTrue(status.confirmed)
+        self.assertEqual(status.block_height, 101)
+
+    def test_preflight_rejects_invalid_address_and_overspend_before_signing(self):
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "preflight-cache.json",
+            backend_factory=lambda network: FakeEsploraBackend(
+                network, funded_ordinals={0: 100_000}
+            ),
+        )
+        service.create_wallet("PreflightWallet", "password")
+
+        with self.assertRaisesRegex(ValueError, "address"):
+            service.prepare_withdrawal("123456", BitcoinAmount(10_000), 2)
+
+        destination = get_new_address(
+            "PreflightWallet", wallet_file=self.wallet_file, network="mainnet"
+        )["address"]
+        with self.assertRaisesRegex(ValueError, "insufficient funds"):
+            service.prepare_withdrawal(
+                destination,
+                BitcoinAmount(100_000),
+                2,
+            )
 
     def test_max_withdrawal_spends_balance_and_cancel_releases_reservation(self):
         cache_file = self.wallet_file.parent / "max-cache.json"
@@ -406,17 +473,16 @@ class BitcoinToolWalletServiceTests(TestCase):
             "MaxWallet", wallet_file=self.wallet_file, network="mainnet"
         )["address"]
 
-        review = service.prepare_withdrawal(
+        draft = service.prepare_withdrawal(
             destination,
             None,
             2,
-            "password",
             send_all=True,
         )
 
-        self.assertTrue(review.send_all)
-        self.assertEqual(review.total.sats, 100_000)
-        service.cancel_withdrawal(review.review_id)
+        self.assertTrue(draft.send_all)
+        self.assertEqual(draft.amount.sats + draft.estimated_fee.sats, 100_000)
+        service.cancel_withdrawal(draft.draft_id)
         cache = json.loads(cache_file.read_text(encoding="utf-8"))
         self.assertEqual(
             cache["wallets"]["MaxWallet"].get("reserved_outpoints", {}),
@@ -441,12 +507,12 @@ class BitcoinToolWalletServiceTests(TestCase):
             network=NETWORK_TESTNET4,
         )["address"]
 
-        review = service.prepare_withdrawal(
+        draft = service.prepare_withdrawal(
             destination,
             BitcoinAmount(10_000),
             2,
-            "password",
         )
+        review = service.sign_withdrawal(draft.draft_id, "password")
         result = service.broadcast_withdrawal(review.review_id)
 
         self.assertEqual(review.network, NETWORK_TESTNET4)

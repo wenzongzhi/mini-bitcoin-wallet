@@ -7,9 +7,11 @@ from .models import (
     BroadcastResult,
     DisplayUnit,
     SendPreview,
+    TransactionStatus,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
+    WithdrawalDraft,
     WithdrawalReview,
 )
 from .ports import WalletService
@@ -32,6 +34,20 @@ class WalletApplication:
         if not normalized:
             raise ValueError("Wallet name cannot be empty.")
         return self._service.select_wallet(normalized)
+
+    def synchronize_wallet(self, name: str) -> WalletSnapshot:
+        normalized = name.strip()
+        if not normalized:
+            raise ValueError("Wallet name cannot be empty.")
+        return self._service.synchronize_wallet(normalized)
+
+    def transaction_status(self, txid: str) -> TransactionStatus:
+        normalized = txid.strip().lower()
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            raise ValueError("Transaction ID must be 64 hexadecimal characters.")
+        return self._service.transaction_status(normalized)
 
     def rename_wallet(self, name: str) -> WalletSnapshot:
         normalized = name.strip()
@@ -82,10 +98,9 @@ class WalletApplication:
         amount_text: str,
         unit: DisplayUnit,
         fee_rate_sat_vb: int,
-        password: str | None,
         *,
         send_all: bool = False,
-    ) -> WithdrawalReview:
+    ) -> WithdrawalDraft:
         normalized_destination = destination.strip()
         if not normalized_destination:
             raise ValueError("Enter a destination address.")
@@ -99,9 +114,15 @@ class WalletApplication:
             normalized_destination,
             amount,
             fee_rate_sat_vb,
-            password,
             send_all=send_all,
         )
+
+    def sign_withdrawal(
+        self, draft_id: str, password: str | None
+    ) -> WithdrawalReview:
+        if not draft_id:
+            raise ValueError("Withdrawal draft identifier is missing.")
+        return self._service.sign_withdrawal(draft_id, password)
 
     def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:
         if not review_id:

@@ -293,12 +293,45 @@ class HomePage(PageBase):
         super().__init__(master, theme, state)
         c = self.content
         c.grid_columnconfigure(0, weight=1)
-        c.grid_rowconfigure(1, weight=1)
+        c.grid_rowconfigure(2, weight=1)
         WalletHeader(c, theme, state).grid(row=0, column=0, sticky="ew",
                                            padx=theme.px(18), pady=(theme.px(14), theme.px(7)))
+        sync_bar = tk.Frame(c, bg=theme.CARD, bd=0)
+        sync_bar.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=theme.px(18),
+            pady=(0, theme.px(2)),
+        )
+        sync_bar.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            sync_bar,
+            textvariable=state.sync_status,
+            bg=theme.CARD,
+            fg=theme.MUTED_2,
+            font=theme.font_small,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew")
+        self.refresh_button = tk.Label(
+            sync_bar,
+            text="↻  Refresh",
+            bg=theme.CARD,
+            fg=theme.PURPLE,
+            font=theme.font_small_bold,
+            cursor="hand2",
+            takefocus=True,
+        )
+        self.refresh_button.grid(row=0, column=1, sticky="e")
+        self.refresh_button.bind("<Button-1>", self._request_refresh)
+        self.refresh_button.bind("<Return>", self._request_refresh)
+        self.refresh_button.bind("<space>", self._request_refresh)
+        state.syncing.trace_add("write", lambda *_: self._update_refresh_button())
+        state.revision.trace_add("write", lambda *_: self._update_refresh_button())
+        self._update_refresh_button()
         self.transaction_list = ScrollableFrame(c, theme)
         self.transaction_list.grid(
-            row=1,
+            row=2,
             column=0,
             sticky="nsew",
             padx=theme.px(18),
@@ -307,7 +340,19 @@ class HomePage(PageBase):
         state.revision.trace_add("write", lambda *_: self._render_transactions())
         self._render_transactions()
         DualActionBar(c, theme, left_command=on_send, right_command=on_receive).grid(
-            row=2, column=0, sticky="ew", padx=theme.px(5), pady=(theme.px(6), theme.px(5)))
+            row=3, column=0, sticky="ew", padx=theme.px(5), pady=(theme.px(6), theme.px(5)))
+
+    def _request_refresh(self, _event=None):
+        if self.state.is_initialized and not self.state.syncing.get():
+            self.state.request_wallet_refresh()
+        return "break"
+
+    def _update_refresh_button(self):
+        enabled = self.state.is_initialized and not self.state.syncing.get()
+        self.refresh_button.configure(
+            fg=self.theme.PURPLE if enabled else self.theme.MUTED_2,
+            cursor="hand2" if enabled else "arrow",
+        )
 
     def _render_transactions(self):
         content = self.transaction_list.content

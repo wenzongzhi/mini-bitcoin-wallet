@@ -11,6 +11,7 @@ from btc.chainparams import NETWORK_MAINNET
 from wallet_core import WalletApplication, WalletService
 from wallet_dialogs import create_new_wallet
 from app_assets import apply_window_icon
+from sync_coordinator import WalletSyncCoordinator
 
 
 class BitcoinWalletApp(tk.Tk):
@@ -40,6 +41,8 @@ class BitcoinWalletApp(tk.Tk):
         self.theme = Theme(self)
         application = WalletApplication(wallet_service)
         self.state = WalletUIState(self, application)
+        self.sync_coordinator = WalletSyncCoordinator(self, self.state)
+        self.protocol("WM_DELETE_WINDOW", self._close_application)
 
         style = ttk.Style(self)
         try:
@@ -69,6 +72,7 @@ class BitcoinWalletApp(tk.Tk):
     def _show_ready_window(self):
         self.deiconify()
         self.lift()
+        self.sync_coordinator.start()
         if not self.state.is_initialized:
             self.after(150, self._offer_wallet_creation)
 
@@ -87,6 +91,10 @@ class BitcoinWalletApp(tk.Tk):
         )
         if should_create:
             create_new_wallet(self, self.state)
+
+    def _close_application(self):
+        self.sync_coordinator.close()
+        self.destroy()
 
     def _show(self, name):
         self.pages[name].lift()

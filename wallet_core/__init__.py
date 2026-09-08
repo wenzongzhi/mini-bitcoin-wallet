@@ -11,11 +11,13 @@ from .models import (
     BroadcastResult,
     DisplayUnit,
     SendPreview,
+    TransactionStatus,
     TransactionDirection,
     TransactionSummary,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
+    WithdrawalDraft,
     WithdrawalReview,
 )
 from .ports import WalletService
@@ -25,6 +27,7 @@ __all__ = [
     "BroadcastResult",
     "DisplayUnit",
     "SendPreview",
+    "TransactionStatus",
     "TransactionDirection",
     "TransactionSummary",
     "WalletApplication",
@@ -32,5 +35,6 @@ __all__ = [
     "WalletService",
     "WalletSnapshot",
     "WalletSummary",
+    "WithdrawalDraft",
     "WithdrawalReview",
 ]

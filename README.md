@@ -16,6 +16,7 @@ Testnet4 while reusing the wallet, network, and Bitcoin primitives copied from
 ```text
 app.py (composition root)
   ├─ pages.py / widgets.py / state.py       presentation (Tkinter)
+  ├─ sync_coordinator.py                    background refresh policy
   ├─ wallet_core/application.py             use cases
   ├─ wallet_core/models.py + ports.py       domain values and interfaces
   ├─ adapters/bitcoin_tool_wallet.py        production adapter
@@ -47,6 +48,13 @@ application use case, UI state, then page or widget.
 - Preset fee rates are 0/1/2/3 sat/vB; Custom selects integer rates from 0 to 20.
   Review requires at least 1 sat/vB because zero-fee transactions are rejected by
   the reused bitcoin-tool workflow and standard relay policy.
+- Home renders cached data immediately, then synchronizes the active wallet in
+  the background. Startup, stale wallet selection, post-broadcast, foreground
+  age, and manual Refresh events share one serialized synchronization queue.
+- Unconfirmed TXIDs use the lightweight Esplora transaction-status endpoint
+  every 30 seconds for ten minutes and every two minutes afterward. Confirmation
+  triggers one complete wallet synchronization. Automatic errors use exponential
+  backoff capped at 15 minutes.
 - Mainnet and Testnet4 use separate wallet, cache, and lock files.
 
 Mnemonic discovery queries a public Esplora service and may reveal scanned
