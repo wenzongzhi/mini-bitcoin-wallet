@@ -6,10 +6,12 @@ from abc import ABC, abstractmethod
 
 from .models import (
     BitcoinAmount,
+    BroadcastResult,
     SendPreview,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
+    WithdrawalReview,
 )
 
 
@@ -52,3 +54,23 @@ class WalletService(ABC):
         send_all: bool = False,
     ) -> SendPreview:
         """Validate and fund a transfer without signing or broadcasting it."""
+
+    @abstractmethod
+    def prepare_withdrawal(
+        self,
+        destination: str,
+        amount: BitcoinAmount | None,
+        fee_rate_sat_vb: int,
+        password: str | None,
+        *,
+        send_all: bool = False,
+    ) -> WithdrawalReview:
+        """Synchronize, fund, and sign a transaction for user review."""
+
+    @abstractmethod
+    def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:
+        """Broadcast a previously reviewed signed transaction."""
+
+    @abstractmethod
+    def cancel_withdrawal(self, review_id: str) -> None:
+        """Release UTXOs reserved by an unbroadcast transaction review."""

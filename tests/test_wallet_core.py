@@ -6,8 +6,9 @@ from unittest import TestCase
 from adapters import BitcoinToolWalletService, DemoWalletService
 from app_settings import ApplicationSettingsStore
 from btc.chainparams import NETWORK_TESTNET4
+from tx.codec import deserialize_transaction_hex, transaction_txid
 from wallet_core import BitcoinAmount, DisplayUnit, WalletApplication
-from wallet import get_wallet_address_book
+from wallet import get_new_address, get_wallet_address_book
 
 
 class FakeEsploraBackend:
@@ -78,6 +79,12 @@ class FakeEsploraBackend:
             }
         ]
 
+    def broadcast_transaction(self, raw_tx_hex):
+        """Accept a valid transaction and return its locally computed TXID."""
+
+        transaction = deserialize_transaction_hex(raw_tx_hex)
+        return transaction_txid(transaction)
+
 
 class BitcoinAmountTests(TestCase):
     def test_parses_btc_without_floating_point_rounding(self):
@@ -130,6 +137,12 @@ class WalletApplicationTests(TestCase):
             self.application.select_wallet("Bitcoin Wallet").name,
             "Bitcoin Wallet",
         )
+
+    def test_rejects_zero_fee_before_transaction_preparation(self):
+        with self.assertRaisesRegex(ValueError, "Zero-fee"):
+            self.application.prepare_withdrawal(
+                "bc1qdestination", "0.001", DisplayUnit.BTC, 0, None
+            )
 
 
 class BitcoinToolWalletServiceTests(TestCase):
@@ -347,4 +360,97 @@ class BitcoinToolWalletServiceTests(TestCase):
             restored.snapshot.transactions[0].explorer_url.startswith(
                 "https://mempool.space/testnet4/tx/"
             )
+        )
+
+    def test_selected_wallet_prepares_and_broadcasts_withdrawal(self):
+        funded_backend = lambda network: FakeEsploraBackend(
+            network, funded_ordinals={0: 100_000}
+        )
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "send-cache.json",
+            backend_factory=funded_backend,
+        )
+        service.create_wallet("Wallet_A", "password-a")
+        service.create_wallet("Wallet_B", "password-b")
+        service.select_wallet("Wallet_B")
+        destination = get_new_address(
+            "Wallet_B", wallet_file=self.wallet_file, network="mainnet"
+        )["address"]
+
+        review = service.prepare_withdrawal(
+            destination,
+            BitcoinAmount(25_000),
+            2,
+            "password-b",
+        )
+
+        self.assertEqual(review.wallet_name, "Wallet_B")
+        self.assertEqual(review.amount.sats, 25_000)
+        self.assertGreater(review.fee.sats, 0)
+        result = service.broadcast_withdrawal(review.review_id)
+        self.assertEqual(result.txid, review.txid)
+        self.assertEqual(result.explorer_url, f"https://mempool.space/tx/{review.txid}")
+
+    def test_max_withdrawal_spends_balance_and_cancel_releases_reservation(self):
+        cache_file = self.wallet_file.parent / "max-cache.json"
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            cache_file,
+            backend_factory=lambda network: FakeEsploraBackend(
+                network, funded_ordinals={0: 100_000}
+            ),
+        )
+        service.create_wallet("MaxWallet", "password")
+        destination = get_new_address(
+            "MaxWallet", wallet_file=self.wallet_file, network="mainnet"
+        )["address"]
+
+        review = service.prepare_withdrawal(
+            destination,
+            None,
+            2,
+            "password",
+            send_all=True,
+        )
+
+        self.assertTrue(review.send_all)
+        self.assertEqual(review.total.sats, 100_000)
+        service.cancel_withdrawal(review.review_id)
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            cache["wallets"]["MaxWallet"].get("reserved_outpoints", {}),
+            {},
+        )
+
+    def test_testnet4_withdrawal_uses_isolated_wallet_and_explorer(self):
+        data_directory = self.wallet_file.parent
+        wallet_file = data_directory / "wallets_testnet4.json"
+        service = BitcoinToolWalletService(
+            wallet_file,
+            data_directory / "send-cache-testnet4.json",
+            network=NETWORK_TESTNET4,
+            backend_factory=lambda network: FakeEsploraBackend(
+                network, funded_ordinals={0: 50_000}
+            ),
+        )
+        service.create_wallet("TestnetWallet", "password")
+        destination = get_new_address(
+            "TestnetWallet",
+            wallet_file=wallet_file,
+            network=NETWORK_TESTNET4,
+        )["address"]
+
+        review = service.prepare_withdrawal(
+            destination,
+            BitcoinAmount(10_000),
+            2,
+            "password",
+        )
+        result = service.broadcast_withdrawal(review.review_id)
+
+        self.assertEqual(review.network, NETWORK_TESTNET4)
+        self.assertEqual(
+            result.explorer_url,
+            f"https://mempool.space/testnet4/tx/{review.txid}",
         )

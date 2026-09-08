@@ -8,6 +8,7 @@ service without changing the pages.
 from .application import WalletApplication
 from .models import (
     BitcoinAmount,
+    BroadcastResult,
     DisplayUnit,
     SendPreview,
     TransactionDirection,
@@ -15,11 +16,13 @@ from .models import (
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
+    WithdrawalReview,
 )
 from .ports import WalletService
 
 __all__ = [
     "BitcoinAmount",
+    "BroadcastResult",
     "DisplayUnit",
     "SendPreview",
     "TransactionDirection",
@@ -29,4 +32,5 @@ __all__ = [
     "WalletService",
     "WalletSnapshot",
     "WalletSummary",
+    "WithdrawalReview",
 ]

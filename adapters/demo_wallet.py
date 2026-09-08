@@ -5,12 +5,14 @@ from datetime import datetime, timezone
 
 from wallet_core.models import (
     BitcoinAmount,
+    BroadcastResult,
     SendPreview,
     TransactionDirection,
     TransactionSummary,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
+    WithdrawalReview,
 )
 from wallet_core.ports import WalletService
 
@@ -105,3 +107,38 @@ class DemoWalletService(WalletService):
         if amount.sats + fee.sats > self._snapshot.balance.sats:
             raise ValueError("The amount and fee exceed the wallet balance.")
         return SendPreview(destination, amount, fee, fee_rate_sat_vb)
+
+    def prepare_withdrawal(
+        self,
+        destination: str,
+        amount: BitcoinAmount | None,
+        fee_rate_sat_vb: int,
+        password: str | None,
+        *,
+        send_all: bool = False,
+    ) -> WithdrawalReview:
+        preview = self.preview_send(
+            destination,
+            amount,
+            fee_rate_sat_vb,
+            send_all=send_all,
+        )
+        return WithdrawalReview(
+            review_id="demo-review",
+            wallet_name=self._snapshot.name,
+            network=self._snapshot.network,
+            txid="0" * 64,
+            destination=destination,
+            amount=preview.amount,
+            fee=preview.fee,
+            fee_rate_sat_vb=fee_rate_sat_vb,
+            send_all=send_all,
+        )
+
+    def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:
+        if review_id != "demo-review":
+            raise ValueError("Withdrawal review does not exist.")
+        return BroadcastResult("0" * 64, "")
+
+    def cancel_withdrawal(self, review_id: str) -> None:
+        return None

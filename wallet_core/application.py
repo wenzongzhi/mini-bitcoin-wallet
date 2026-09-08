@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from .models import (
     BitcoinAmount,
+    BroadcastResult,
     DisplayUnit,
     SendPreview,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
+    WithdrawalReview,
 )
 from .ports import WalletService
 
@@ -73,3 +75,39 @@ class WalletApplication:
             fee_rate_sat_vb,
             send_all=send_all,
         )
+
+    def prepare_withdrawal(
+        self,
+        destination: str,
+        amount_text: str,
+        unit: DisplayUnit,
+        fee_rate_sat_vb: int,
+        password: str | None,
+        *,
+        send_all: bool = False,
+    ) -> WithdrawalReview:
+        normalized_destination = destination.strip()
+        if not normalized_destination:
+            raise ValueError("Enter a destination address.")
+        if isinstance(fee_rate_sat_vb, bool) or not 1 <= fee_rate_sat_vb <= 20:
+            raise ValueError(
+                "Choose a fee rate from 1 to 20 sat/vB. "
+                "Zero-fee transactions are not accepted by bitcoin-tool or standard relays."
+            )
+        amount = None if send_all else BitcoinAmount.parse(amount_text, unit)
+        return self._service.prepare_withdrawal(
+            normalized_destination,
+            amount,
+            fee_rate_sat_vb,
+            password,
+            send_all=send_all,
+        )
+
+    def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:
+        if not review_id:
+            raise ValueError("Withdrawal review identifier is missing.")
+        return self._service.broadcast_withdrawal(review_id)
+
+    def cancel_withdrawal(self, review_id: str) -> None:
+        if review_id:
+            self._service.cancel_withdrawal(review_id)

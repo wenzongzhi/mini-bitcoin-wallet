@@ -116,3 +116,31 @@ class SendPreview:
     @property
     def total(self) -> BitcoinAmount:
         return BitcoinAmount(self.amount.sats + self.fee.sats)
+
+
+@dataclass(frozen=True, slots=True)
+class WithdrawalReview:
+    """Exact signed transaction values awaiting broadcast confirmation."""
+
+    review_id: str
+    wallet_name: str
+    network: str
+    txid: str
+    destination: str
+    amount: BitcoinAmount
+    fee: BitcoinAmount
+    fee_rate_sat_vb: int
+    send_all: bool
+
+    @property
+    def total(self) -> BitcoinAmount:
+        return BitcoinAmount(self.amount.sats + self.fee.sats)
+
+
+@dataclass(frozen=True, slots=True)
+class BroadcastResult:
+    """Public result returned after a transaction broadcast attempt succeeds."""
+
+    txid: str
+    explorer_url: str
+    cache_warning: str | None = None

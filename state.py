@@ -13,6 +13,8 @@ from wallet_core import (
     WalletApplication,
     WalletCreation,
     WalletSummary,
+    WithdrawalReview,
+    BroadcastResult,
 )
 
 
@@ -46,6 +48,17 @@ class WalletUIState:
         return self._snapshot.name if self._snapshot.is_initialized else None
 
     @property
+    def active_wallet_encrypted(self) -> bool:
+        return next(
+            (
+                wallet.encrypted
+                for wallet in self._wallets
+                if wallet.name == self.active_wallet_name
+            ),
+            False,
+        )
+
+    @property
     def unit(self) -> DisplayUnit:
         return DisplayUnit(self.display_unit.get())
 
@@ -68,7 +81,11 @@ class WalletUIState:
         return creation
 
     def select_wallet(self, name: str) -> None:
-        self._apply_snapshot(self.application.select_wallet(name))
+        snapshot = self.application.select_wallet(name)
+        self.amount.set("")
+        self.address.set("")
+        self.send_all.set(False)
+        self._apply_snapshot(snapshot)
 
     def apply_wallet_creation(self, creation: WalletCreation) -> None:
         """Apply a wallet created by a background application use case."""
@@ -106,6 +123,34 @@ class WalletUIState:
             fee_rate_sat_vb,
             send_all=self.send_all.get(),
         )
+
+    def prepare_withdrawal(
+        self, fee_rate_sat_vb: int, password: str | None
+    ) -> WithdrawalReview:
+        return self.application.prepare_withdrawal(
+            self.address.get(),
+            self.amount.get(),
+            self.unit,
+            fee_rate_sat_vb,
+            password,
+            send_all=self.send_all.get(),
+        )
+
+    def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:
+        result = self.application.broadcast_withdrawal(review_id)
+        self.reload_wallet()
+        return result
+
+    def cancel_withdrawal(self, review_id: str) -> None:
+        self.application.cancel_withdrawal(review_id)
+
+    def apply_broadcast_success(self) -> None:
+        """Clear the completed form and refresh all wallet-facing screens."""
+
+        self.amount.set("")
+        self.address.set("")
+        self.send_all.set(False)
+        self.reload_wallet()
 
     def fiat_zero_text(self) -> str:
         return {

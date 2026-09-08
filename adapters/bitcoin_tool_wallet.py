@@ -20,16 +20,31 @@ from wallet import (
     mnemonic_from_entropy_hex,
     sync_wallet,
 )
-from wallet.wallet_cache import read_wallet_cache_entry
+from wallet.wallet_cache import (
+    load_wallet_cache,
+    locked_cache_file,
+    read_wallet_cache_entry,
+    save_wallet_cache,
+)
+from tx import (
+    TransactionError,
+    broadcast_signed_transaction,
+    create_raw_transaction,
+    fund_all_transaction,
+    fund_transaction,
+    sign_funded_transaction,
+)
 
 from wallet_core.models import (
     BitcoinAmount,
+    BroadcastResult,
     SendPreview,
     TransactionDirection,
     TransactionSummary,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
+    WithdrawalReview,
 )
 from wallet_core.ports import WalletService
 from app_settings import ApplicationSettingsStore
@@ -67,6 +82,7 @@ class BitcoinToolWalletService(WalletService):
         self._backend_factory = backend_factory or (
             lambda selected_network: EsploraBackend(network=selected_network)
         )
+        self._prepared_withdrawals: dict[str, dict] = {}
         self._wallet_name = self._resolve_active_wallet()
 
     def _read_wallet_records(self) -> dict:
@@ -398,3 +414,160 @@ class BitcoinToolWalletService(WalletService):
         send_all: bool = False,
     ) -> SendPreview:
         raise ValueError("Transaction funding will be connected in the next business feature.")
+
+    def prepare_withdrawal(
+        self,
+        destination: str,
+        amount: BitcoinAmount | None,
+        fee_rate_sat_vb: int,
+        password: str | None,
+        *,
+        send_all: bool = False,
+    ) -> WithdrawalReview:
+        """Synchronize and sign using the same workflow as sendtoaddress/sendall."""
+
+        if self._wallet_name is None:
+            raise ValueError("Create or import a wallet before sending Bitcoin.")
+        wallet_name = self._wallet_name
+        backend = self._backend_factory(self.network)
+        funded = None
+        try:
+            sync_wallet(
+                wallet_name,
+                wallet_file=self.wallet_file,
+                cache_file=self.cache_file,
+                backend=backend,
+                include_transactions=False,
+                network=self.network,
+            )
+            if send_all:
+                funded = fund_all_transaction(
+                    destination,
+                    wallet_name,
+                    self.cache_file,
+                    self.network,
+                    self.ADDRESS_TYPE,
+                    fee_rate_sat_vb,
+                    utxo_source="fresh backend synchronization",
+                )
+            else:
+                if amount is None:
+                    raise ValueError("Enter an amount.")
+                template = create_raw_transaction(
+                    [],
+                    [{"address": destination, "amount_sats": amount.sats}],
+                    self.network,
+                )
+                funded = fund_transaction(
+                    template,
+                    wallet_name,
+                    self.wallet_file,
+                    self.cache_file,
+                    self.network,
+                    self.ADDRESS_TYPE,
+                    fee_rate_sat_vb,
+                    utxo_source="fresh backend synchronization",
+                )
+            signed = sign_funded_transaction(
+                funded,
+                wallet_name,
+                password,
+                self.wallet_file,
+                self.cache_file,
+                self.network,
+            )
+        except (TransactionError, WalletError, EsploraError) as exc:
+            if funded is not None:
+                self._release_withdrawal_reservations(
+                    wallet_name, funded.get("draft_id")
+                )
+            raise ValueError(str(exc)) from exc
+
+        review_id = signed["draft_id"]
+        self._prepared_withdrawals[review_id] = signed
+        destination_sats = sum(
+            output["value"]
+            for output in signed["outputs"]
+            if output.get("is_change") is False
+        )
+        return WithdrawalReview(
+            review_id=review_id,
+            wallet_name=wallet_name,
+            network=self.network,
+            txid=signed["txid"],
+            destination=destination,
+            amount=BitcoinAmount(destination_sats),
+            fee=BitcoinAmount(signed["fee_sats"]),
+            fee_rate_sat_vb=fee_rate_sat_vb,
+            send_all=send_all,
+        )
+
+    def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:
+        signed = self._prepared_withdrawals.get(review_id)
+        if signed is None:
+            raise ValueError("Withdrawal review has expired or does not exist.")
+        backend = self._backend_factory(self.network)
+        try:
+            result = broadcast_signed_transaction(
+                signed,
+                self.network,
+                backend,
+                cache_file=self.cache_file,
+            )
+        except (TransactionError, WalletError, EsploraError) as exc:
+            raise ValueError(str(exc)) from exc
+
+        self._prepared_withdrawals.pop(review_id, None)
+        warning = result.get("cache_warning")
+        try:
+            sync_wallet(
+                signed["wallet_name"],
+                wallet_file=self.wallet_file,
+                cache_file=self.cache_file,
+                backend=backend,
+                include_transactions=True,
+                network=self.network,
+            )
+        except (WalletError, EsploraError) as exc:
+            warning = warning or f"Broadcast succeeded, but wallet refresh failed: {exc}"
+        return BroadcastResult(
+            txid=result["txid"],
+            explorer_url=self._transaction_explorer_url(result["txid"]),
+            cache_warning=warning,
+        )
+
+    def cancel_withdrawal(self, review_id: str) -> None:
+        signed = self._prepared_withdrawals.pop(review_id, None)
+        if signed is not None:
+            self._release_withdrawal_reservations(
+                signed["wallet_name"], signed["draft_id"]
+            )
+
+    def _release_withdrawal_reservations(
+        self, wallet_name: str, draft_id: str | None
+    ) -> None:
+        """Release the copied workflow's cache reservation after cancel/failure."""
+
+        if not draft_id or not self.cache_file.exists():
+            return
+        try:
+            with locked_cache_file(self.cache_file):
+                cache = load_wallet_cache(self.cache_file)
+                wallet_cache = cache.get("wallets", {}).get(wallet_name)
+                if not isinstance(wallet_cache, dict):
+                    return
+                reservations = wallet_cache.get("reserved_outpoints", {})
+                if not isinstance(reservations, dict):
+                    return
+                remaining = {
+                    outpoint: reservation
+                    for outpoint, reservation in reservations.items()
+                    if not isinstance(reservation, dict)
+                    or reservation.get("draft_id") != draft_id
+                }
+                if remaining != reservations:
+                    wallet_cache["reserved_outpoints"] = remaining
+                    save_wallet_cache(cache, self.cache_file)
+        except WalletError:
+            # The original transaction error remains more useful to the caller.
+            return

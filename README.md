@@ -19,7 +19,7 @@ app.py (composition root)
   ├─ wallet_core/application.py             use cases
   ├─ wallet_core/models.py + ports.py       domain values and interfaces
   ├─ adapters/bitcoin_tool_wallet.py        production adapter
-  └─ btc/ + wallet/ + network/              copied bitcoin-tool implementation
+  └─ btc/ + wallet/ + network/ + tx/        copied bitcoin-tool implementation
 ```
 
 The copied `bitcoin-tool` packages are accessed through
@@ -40,6 +40,13 @@ application use case, UI state, then page or widget.
 - Balance and history include both receive and change addresses.
 - Transaction rows show block time and open a detail dialog with TXID copy and
   the correct mainnet or Testnet4 mempool.space link.
+- Withdrawals synchronize the active wallet, build and sign an exact transaction
+  for review, and broadcast only after explicit confirmation.
+- Max spends every eligible UTXO from the active wallet in one transaction; a
+  cancelled review releases its temporary UTXO reservations.
+- Preset fee rates are 0/1/2/3 sat/vB; Custom selects integer rates from 0 to 20.
+  Review requires at least 1 sat/vB because zero-fee transactions are rejected by
+  the reused bitcoin-tool workflow and standard relay policy.
 - Mainnet and Testnet4 use separate wallet, cache, and lock files.
 
 Mnemonic discovery queries a public Esplora service and may reveal scanned
@@ -84,6 +91,7 @@ mini-bitcoin-wallet/
 ├── icon/
 ├── btc/
 ├── network/
+├── tx/
 ├── wallet/
 ├── wallet_core/
 ├── wallet_manager.py

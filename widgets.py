@@ -60,6 +60,7 @@ class RoundedScrollbar(tk.Canvas):
         self._drag_offset = None
         self._thumb_bounds = (0.0, 0.0)
         self._selected = False
+        self._photo = None
 
         self.bind("<Configure>", self._draw)
         self.bind("<ButtonPress-1>", self._on_press)
@@ -96,57 +97,61 @@ class RoundedScrollbar(tk.Canvas):
         return width, height, arrow_zone, track_top, track_bottom, minimum_length
 
     def _draw(self, _event=None):
-        self.delete("all")
         width, height, arrow_zone, track_top, track_bottom, minimum = self._geometry()
         self._thumb_bounds = _scroll_thumb_bounds(
             self._first, self._last, track_top, track_bottom, minimum
         )
 
+        scale = SUPERSAMPLE
+        image = Image.new(
+            "RGBA", (width * scale, height * scale), self.theme.CARD
+        )
+        draw = ImageDraw.Draw(image)
         arrow_half_width = self.theme.px(4)
         arrow_half_height = self.theme.px(3)
         center_x = width / 2
         top_y = arrow_zone / 2
         bottom_y = height - arrow_zone / 2
-        self.create_polygon(
-            center_x - arrow_half_width,
-            top_y + arrow_half_height,
-            center_x + arrow_half_width,
-            top_y + arrow_half_height,
-            center_x,
-            top_y - arrow_half_height,
+        draw.polygon(
+            [
+                ((center_x - arrow_half_width) * scale, (top_y + arrow_half_height) * scale),
+                ((center_x + arrow_half_width) * scale, (top_y + arrow_half_height) * scale),
+                (center_x * scale, (top_y - arrow_half_height) * scale),
+            ],
             fill=self.theme.SCROLL_ARROW,
-            outline="",
         )
-        self.create_polygon(
-            center_x - arrow_half_width,
-            bottom_y - arrow_half_height,
-            center_x + arrow_half_width,
-            bottom_y - arrow_half_height,
-            center_x,
-            bottom_y + arrow_half_height,
+        draw.polygon(
+            [
+                ((center_x - arrow_half_width) * scale, (bottom_y - arrow_half_height) * scale),
+                ((center_x + arrow_half_width) * scale, (bottom_y - arrow_half_height) * scale),
+                (center_x * scale, (bottom_y + arrow_half_height) * scale),
+            ],
             fill=self.theme.SCROLL_ARROW,
-            outline="",
         )
 
         thumb_top, thumb_bottom = self._thumb_bounds
         thumb_width = self.theme.px(8)
-        left = (width - thumb_width) / 2
+        left = (width - thumb_width) // 2
         right = left + thumb_width
-        radius = thumb_width / 2
         fill = (
             self.theme.SCROLL_THUMB_ACTIVE
             if self._selected
             else self.theme.SCROLL_THUMB
         )
-        self.create_rectangle(
-            left, thumb_top + radius, right, thumb_bottom - radius, fill=fill, outline=""
+        draw.rounded_rectangle(
+            (
+                left * scale,
+                round(thumb_top * scale),
+                right * scale - 1,
+                max(round(thumb_top * scale), round(thumb_bottom * scale) - 1),
+            ),
+            radius=thumb_width * scale // 2,
+            fill=fill,
         )
-        self.create_oval(
-            left, thumb_top, right, thumb_top + thumb_width, fill=fill, outline=""
-        )
-        self.create_oval(
-            left, thumb_bottom - thumb_width, right, thumb_bottom, fill=fill, outline=""
-        )
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+        self._photo = ImageTk.PhotoImage(image)
+        self.delete("all")
+        self.create_image(0, 0, image=self._photo, anchor="nw")
 
     def _on_press(self, event):
         self.focus_set()
@@ -228,7 +233,9 @@ class ScrollableFrame(tk.Frame):
         self.scrollbar = RoundedScrollbar(self, theme, command=self.canvas.yview)
         self.canvas.configure(yscrollcommand=self.scrollbar.set)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.scrollbar.grid(
+            row=0, column=1, sticky="ns", padx=(theme.px(7), 0)
+        )
         self.content = tk.Frame(self.canvas, bg=theme.CARD, bd=0)
         self.content.grid_columnconfigure(0, weight=1)
         self._content_window = self.canvas.create_window(
@@ -704,32 +711,34 @@ class FeeTooltip:
 
 
 class FeeSlider(tk.Canvas):
-    PRESET_SAT_VB = (1, 3, 8, 20)
+    PRESET_SAT_VB = (0, 1, 2, 3)
+    CUSTOM_MAX_SAT_VB = 20
 
     def __init__(self, master, theme: Theme, fiat_text_callback, custom=False, active=False):
         self.theme = theme
         self.fiat_text_callback = fiat_text_callback
         self.custom = bool(custom)
         self.active = bool(active)
-        self.value = 1 if self.custom else 2
+        self.value = 10 if self.custom else 2
         self.base_height = 44
         self._track_photo = None
         self._knob_photo = None
         self._track_key = None
         self._knob_key = None
+        self._tooltip_hide_job = None
         super().__init__(master, bg=theme.CARD, highlightthickness=0, bd=0,
                          cursor="arrow", height=theme.px(self.base_height))
         self.tooltip = FeeTooltip(self, theme)
         self.bind("<Configure>", self._draw)
         self.bind("<Button-1>", self._press)
         self.bind("<B1-Motion>", self._drag)
-        self.bind("<ButtonRelease-1>", lambda e: self.tooltip.hide())
-        self.bind("<Leave>", lambda e: self.tooltip.hide())
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Leave>", self._hide_tooltip)
         self.bind("<<UIScaleChanged>>", self._rescale, add="+")
 
     def set_custom(self, custom):
         self.custom = bool(custom)
-        self.value = 1 if self.custom else 2
+        self.value = 10 if self.custom else 2
         self._draw()
 
     def set_active(self, active):
@@ -764,14 +773,40 @@ class FeeSlider(tk.Canvas):
         knob_r = max(10, self.theme.px(13))
         margin = knob_r + self.theme.px(3)  # fixes endpoint clipping
         usable = max(1, w - margin * 2)
-        ratio = (int(self.value)-1)/99.0 if self.custom else int(self.value)/3.0
+        ratio = (
+            int(self.value) / self.CUSTOM_MAX_SAT_VB
+            if self.custom
+            else int(self.value) / 3.0
+        )
         return w, h, knob_r, margin, usable, margin + usable*ratio, h/2
 
     def _set_from_x(self, x):
         _, _, _, margin, usable, _, _ = self._geometry()
         ratio = max(0.0, min(1.0, (x-margin)/usable))
-        self.value = 1 + round(ratio*99) if self.custom else round(ratio*3)
+        self.value = (
+            round(ratio * self.CUSTOM_MAX_SAT_VB)
+            if self.custom
+            else round(ratio * 3)
+        )
         self._draw()
+
+    def _release(self, _event=None):
+        # Keep the selected fee visible long enough to read after a click.
+        self._cancel_tooltip_hide()
+        self._tooltip_hide_job = self.after(800, self._hide_tooltip_after_delay)
+
+    def _cancel_tooltip_hide(self):
+        if self._tooltip_hide_job is not None:
+            self.after_cancel(self._tooltip_hide_job)
+            self._tooltip_hide_job = None
+
+    def _hide_tooltip(self, _event=None):
+        self._cancel_tooltip_hide()
+        self.tooltip.hide()
+
+    def _hide_tooltip_after_delay(self):
+        self._tooltip_hide_job = None
+        self.tooltip.hide()
 
     @staticmethod
     def _hex_to_rgb(value):
@@ -829,6 +864,7 @@ class FeeSlider(tk.Canvas):
         self.create_image(x, y, image=self._knob_photo, anchor="center")
 
     def _show_tooltip(self):
+        self._cancel_tooltip_hide()
         _, _, _, _, _, x, _ = self._geometry()
         text = f"{self.current_sat_vb()} sat/vB  ≈  {self.fiat_text_callback()}"
         self.tooltip.show(text, self.winfo_rootx()+x, self.winfo_rooty()+self.winfo_height()/2)

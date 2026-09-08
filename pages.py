@@ -20,6 +20,7 @@ from widgets import (
     ScrollableFrame,
 )
 from transaction_dialog import format_transaction_time, show_transaction_details
+from withdrawal_dialogs import review_withdrawal
 
 
 class WalletSelector(tk.Frame):
@@ -456,9 +457,9 @@ class FeeAxis(tk.Frame):
         if self.custom:
             self.grid_columnconfigure(0, weight=1)
             self.grid_columnconfigure(1, weight=1)
-            tk.Label(self, text="Slow", bg=self.theme.CARD, fg="#B3B8BD",
+            tk.Label(self, text="Slow · 0 sat/vB", bg=self.theme.CARD, fg="#B3B8BD",
                      font=self.theme.font_small, anchor="w").grid(row=0, column=0, sticky="ew")
-            tk.Label(self, text="Fast", bg=self.theme.CARD, fg="#B3B8BD",
+            tk.Label(self, text="Fast · 20 sat/vB", bg=self.theme.CARD, fg="#B3B8BD",
                      font=self.theme.font_small, anchor="e").grid(row=0, column=1, sticky="ew")
         else:
             labels = ("~ 24 hrs", "~ 4 hrs", "~ 60 min", "~ 10 min")
@@ -526,8 +527,13 @@ class SendPage(PageBase):
         tk.Label(custom_box, text="Custom", bg=theme.CARD, fg=theme.MUTED,
                  font=theme.font_small).pack(side="left")
 
-        self.fee_slider = FeeSlider(form, theme, fiat_text_callback=state.fiat_zero_text,
-                                    custom=state.custom_fee.get(), active=False)
+        self.fee_slider = FeeSlider(
+            form,
+            theme,
+            fiat_text_callback=state.fiat_zero_text,
+            custom=state.custom_fee.get(),
+            active=state.is_initialized,
+        )
         self.fee_slider.grid(row=5, column=0, sticky="ew", pady=(theme.px(3), 0))
         self.fee_axis = FeeAxis(form, theme)
         self.fee_axis.grid(row=6, column=0, sticky="ew")
@@ -541,6 +547,7 @@ class SendPage(PageBase):
         state.amount.trace_add("write", lambda *_: self._update_fee_active())
         state.address.trace_add("write", lambda *_: self._update_fee_active())
         state.display_unit.trace_add("write", lambda *_: self._sync_segment())
+        state.revision.trace_add("write", lambda *_: self._wallet_changed())
         self._update_fee_active()
 
     def _change_unit(self, unit):
@@ -560,28 +567,19 @@ class SendPage(PageBase):
         self._update_fee_active()
 
     def _update_fee_active(self):
-        self.fee_slider.set_active(
-            self.state.amount_is_valid() and bool(self.state.address.get().strip())
+        self.fee_slider.set_active(self.state.is_initialized)
+
+    def _wallet_changed(self):
+        self.max_toggle.set_checked(self.state.send_all.get())
+        self.amount_entry.entry.configure(
+            state="disabled" if self.state.send_all.get() else "normal"
         )
+        self._update_fee_active()
 
     def _review_send(self):
-        try:
-            preview = self.state.preview_send(self.fee_slider.current_sat_vb())
-        except ValueError as exc:
-            messagebox.showerror("Cannot Review Withdrawal", str(exc), parent=self.winfo_toplevel())
-            return
-        messagebox.showinfo(
-            "Review Withdrawal",
-            "\n".join(
-                (
-                    f"Send: {preview.amount.format(DisplayUnit.BTC)} BTC",
-                    f"Fee: {preview.fee.format(DisplayUnit.SATS)} sats",
-                    f"Total: {preview.total.format(DisplayUnit.BTC)} BTC",
-                    f"Fee rate: {preview.fee_rate_sat_vb} sat/vB",
-                    f"To: {preview.destination}",
-                    "",
-                    "This demo backend does not sign or broadcast.",
-                )
-            ),
-            parent=self.winfo_toplevel(),
+        review_withdrawal(
+            self.winfo_toplevel(),
+            self.theme,
+            self.state,
+            self.fee_slider.current_sat_vb(),
         )
