@@ -49,20 +49,9 @@ class WalletUIState:
 
     @property
     def monitored_transaction_ids(self) -> tuple[str, ...]:
-        """Return pending and unconfirmed TXIDs without duplicates."""
+        """Return transactions broadcast by this wallet that await confirmation."""
 
-        return tuple(
-            dict.fromkeys(
-                (
-                    *self._snapshot.pending_txids,
-                    *(
-                        transaction.txid
-                        for transaction in self._snapshot.transactions
-                        if not transaction.confirmed
-                    ),
-                )
-            )
-        )
+        return tuple(dict.fromkeys(self._snapshot.pending_txids))
 
     @property
     def wallets(self) -> tuple[WalletSummary, ...]:

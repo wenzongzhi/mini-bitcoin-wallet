@@ -178,6 +178,26 @@ class EsploraBackend:
             raise EsploraError("invalid raw transaction response")
         return raw_hex.lower()
 
+    def get_transaction_status(self, txid: str) -> dict:
+        """Return the confirmation state for one transaction."""
+
+        if not isinstance(txid, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", txid):
+            raise EsploraError("transaction id must be 64 hexadecimal characters")
+        status = self._get_json(f"/tx/{txid.lower()}/status")
+        if not isinstance(status, dict) or not isinstance(status.get("confirmed"), bool):
+            raise EsploraError("invalid transaction status response")
+        for field in ("block_height", "block_time"):
+            value = status.get(field)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                raise EsploraError("invalid transaction status response")
+        block_hash = status.get("block_hash")
+        if block_hash is not None and (
+            not isinstance(block_hash, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", block_hash)
+        ):
+            raise EsploraError("invalid transaction status response")
+        return status
+
     def get_fee_estimates(self) -> dict[str, Decimal]:
         data = self._get_json("/fee-estimates")
         if not isinstance(data, dict):

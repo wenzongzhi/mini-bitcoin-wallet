@@ -51,7 +51,6 @@ from wallet_core.models import (
 )
 from wallet_core.ports import WalletService
 from app_settings import ApplicationSettingsStore
-from .wallet_esplora_backend import WalletEsploraBackend
 
 
 class BitcoinToolWalletService(WalletService):
@@ -84,7 +83,7 @@ class BitcoinToolWalletService(WalletService):
         )
         self.settings.ensure_exists()
         self._backend_factory = backend_factory or (
-            lambda selected_network: WalletEsploraBackend(network=selected_network)
+            lambda selected_network: EsploraBackend(network=selected_network)
         )
         self._operation_lock = RLock()
         self._funded_withdrawals: dict[str, dict] = {}

@@ -24,10 +24,10 @@ app.py (composition root)
 ```
 
 The copied `bitcoin-tool` packages are accessed through
-`BitcoinToolWalletService`; the upstream project is not modified. The adapter
-owns network selection, wallet paths, synchronization, and conversion to domain
-models. New features should be added in this order: domain model, service port,
-application use case, UI state, then page or widget.
+`BitcoinToolWalletService`. The adapter owns network selection, wallet paths,
+synchronization, and conversion to domain models. New features should be added
+in this order: domain model, service port, application use case, UI state, then
+page or widget.
 
 ## Wallet setup behavior
 
@@ -48,13 +48,16 @@ application use case, UI state, then page or widget.
 - Preset fee rates are 0/1/2/3 sat/vB; Custom selects integer rates from 0 to 20.
   Review requires at least 1 sat/vB because zero-fee transactions are rejected by
   the reused bitcoin-tool workflow and standard relay policy.
-- Home renders cached data immediately, then synchronizes the active wallet in
-  the background. Startup, stale wallet selection, post-broadcast, foreground
-  age, and manual Refresh events share one serialized synchronization queue.
-- Unconfirmed TXIDs use the lightweight Esplora transaction-status endpoint
-  every 30 seconds for ten minutes and every two minutes afterward. Confirmation
-  triggers one complete wallet synchronization. Automatic errors use exponential
-  backoff capped at 15 minutes.
+- Home renders cached data immediately. A complete background synchronization
+  runs once at startup, after every wallet selection, and on manual Refresh.
+  Transaction preparation also performs its own UTXO synchronization before
+  funding. There is no periodic foreground scan and no full scan immediately
+  after broadcast.
+- Broadcast transactions use the lightweight Esplora transaction-status endpoint
+  every 30 seconds for ten minutes and every two minutes afterward. Polling stops
+  when confirmation is detected, then one complete wallet synchronization
+  refreshes balance and history. Status-query errors use exponential backoff
+  capped at 15 minutes.
 - Mainnet and Testnet4 use separate wallet, cache, and lock files.
 
 Mnemonic discovery queries a public Esplora service and may reveal scanned

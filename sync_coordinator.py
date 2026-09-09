@@ -1,14 +1,14 @@
 """Background synchronization policy for the desktop wallet.
 
-This module owns timing, deduplication, and retry decisions.  It depends only on
-wallet-core use cases and presentation state; bitcoin-tool remains an unchanged
-infrastructure dependency behind the application boundary.
+Full wallet scans are deliberately event-driven because public Esplora servers
+are a shared resource.  Lightweight transaction-status requests are scheduled
+separately and stop after the transaction is confirmed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from queue import Empty, Queue
 from threading import Thread
 import time
@@ -21,10 +21,6 @@ from state import WalletUIState
 class SyncPolicy:
     """Tunable public-backend request policy, expressed in seconds."""
 
-    switch_stale_after: int = 120
-    foreground_sync_after: int = 300
-    foreground_check_every: int = 60
-    post_broadcast_delay: int = 5
     status_fast_interval: int = 30
     status_fast_window: int = 10 * 60
     status_slow_interval: int = 120
@@ -57,15 +53,15 @@ class WalletSyncCoordinator:
         self.policy = policy or SyncPolicy()
         self._results: Queue = Queue(maxsize=1)
         self._worker_active = False
-        self._pending_full_sync: tuple[str, bool, str | None] | None = None
+        self._pending_full_sync: tuple[str, str | None] | None = None
         self._closed = False
         self._poll_job = None
-        self._foreground_job = None
         self._status_job = None
         self._failures = 0
         self._next_automatic_attempt = 0.0
         self._first_monitored: dict[tuple[str, str], float] = {}
         self._last_status_check: dict[tuple[str, str], float] = {}
+        self._confirmed_transactions: set[tuple[str, str]] = set()
 
         root.bind("<<ActiveWalletChanged>>", self._wallet_changed, add="+")
         root.bind("<<WalletRefreshRequested>>", self._manual_refresh, add="+")
@@ -76,15 +72,14 @@ class WalletSyncCoordinator:
 
         if self._closed:
             return
-        self.root.after(250, lambda: self.request_full_sync("startup", force=True))
-        self._schedule_foreground_check()
+        self.root.after(250, lambda: self.request_full_sync("startup"))
         self._schedule_status_check()
 
     def close(self) -> None:
         """Stop scheduling callbacks; running daemon work may finish naturally."""
 
         self._closed = True
-        for job in (self._poll_job, self._foreground_job, self._status_job):
+        for job in (self._poll_job, self._status_job):
             if job is not None:
                 try:
                     self.root.after_cancel(job)
@@ -95,26 +90,15 @@ class WalletSyncCoordinator:
         self,
         reason: str,
         *,
-        force: bool = False,
         wallet_name: str | None = None,
     ) -> None:
+        """Queue one full scan for an explicit wallet lifecycle event."""
+
         wallet_name = wallet_name or self.state.active_wallet_name
         if self._closed or wallet_name is None:
             return
         if self._worker_active:
-            self._pending_full_sync = (reason, force, wallet_name)
-            return
-        if (
-            not force
-            and wallet_name == self.state.active_wallet_name
-            and not self._wallet_cache_is_stale(reason)
-        ):
-            return
-        if (
-            not force
-            and reason != "manual"
-            and time.monotonic() < self._next_automatic_attempt
-        ):
+            self._pending_full_sync = (reason, wallet_name)
             return
 
         if wallet_name == self.state.active_wallet_name:
@@ -125,33 +109,17 @@ class WalletSyncCoordinator:
             lambda: self.state.application.synchronize_wallet(wallet_name),
         )
 
-    def _wallet_cache_is_stale(self, reason: str) -> bool:
-        synced_at = self.state.synced_at
-        if synced_at is None:
-            return True
-        maximum_age = (
-            self.policy.switch_stale_after
-            if reason == "wallet-change"
-            else self.policy.foreground_sync_after
-        )
-        age = (datetime.now(timezone.utc) - synced_at).total_seconds()
-        return age >= maximum_age
-
     def _wallet_changed(self, _event=None) -> None:
         self._discard_other_wallet_monitoring()
         self.request_full_sync("wallet-change")
 
     def _manual_refresh(self, _event=None) -> None:
-        self.request_full_sync("manual", force=True)
+        self.request_full_sync("manual")
 
     def _broadcast_completed(self, _event=None) -> None:
-        wallet_name = self.state.active_wallet_name
-        self.state.set_sync_activity(False, "Broadcast accepted · refresh queued")
-        self.root.after(
-            self.policy.post_broadcast_delay * 1000,
-            lambda: self.request_full_sync(
-                "post-broadcast", force=True, wallet_name=wallet_name
-            ),
+        self.state.set_sync_activity(
+            False,
+            "Broadcast accepted · monitoring confirmation",
         )
 
     def _start_worker(self, kind: str, wallet_name: str, operation) -> None:
@@ -182,7 +150,7 @@ class WalletSyncCoordinator:
         self._poll_job = None
         self._worker_active = False
         if error is not None:
-            self._record_failure(error, wallet_name)
+            self._record_failure(kind, error, wallet_name)
         elif kind == "full":
             self._record_success()
             if self.state.apply_synchronized_snapshot(result):
@@ -192,49 +160,52 @@ class WalletSyncCoordinator:
                 self.state.set_sync_activity(False, "")
         elif kind == "status":
             self._record_success()
-            if wallet_name == self.state.active_wallet_name and any(
-                status.confirmed for status in result
-            ):
-                self.request_full_sync("transaction-confirmed", force=True)
+            confirmed_txids = {
+                status.txid for status in result if status.confirmed
+            }
+            self._confirmed_transactions.update(
+                (wallet_name, txid) for txid in confirmed_txids
+            )
+            if wallet_name == self.state.active_wallet_name and confirmed_txids:
+                self.request_full_sync("transaction-confirmed")
+            elif wallet_name == self.state.active_wallet_name:
+                self.state.set_sync_activity(
+                    False,
+                    "Waiting for transaction confirmation",
+                )
 
         pending = self._pending_full_sync
         self._pending_full_sync = None
         if pending is not None:
-            reason, force, pending_wallet = pending
+            reason, pending_wallet = pending
             self.root.after(
                 0,
-                lambda: self.request_full_sync(
-                    reason, force=force, wallet_name=pending_wallet
-                ),
+                lambda: self.request_full_sync(reason, wallet_name=pending_wallet),
             )
 
     def _record_success(self) -> None:
         self._failures = 0
         self._next_automatic_attempt = 0.0
 
-    def _record_failure(self, _error: Exception, wallet_name: str) -> None:
+    def _record_failure(
+        self,
+        kind: str,
+        _error: Exception,
+        wallet_name: str,
+    ) -> None:
         self._failures += 1
         delay = self.policy.retry_delay(self._failures)
         self._next_automatic_attempt = time.monotonic() + delay
         if wallet_name == self.state.active_wallet_name:
+            message = (
+                f"Confirmation check unavailable · retrying in {delay}s"
+                if kind == "status"
+                else "Sync unavailable · use Refresh to retry"
+            )
             self.state.set_sync_activity(
                 False,
-                f"Sync unavailable · retrying in {delay}s",
+                message,
             )
-
-    def _schedule_foreground_check(self) -> None:
-        if self._closed:
-            return
-        self._foreground_job = self.root.after(
-            self.policy.foreground_check_every * 1000,
-            self._foreground_check,
-        )
-
-    def _foreground_check(self) -> None:
-        self._foreground_job = None
-        if self._window_is_active():
-            self.request_full_sync("foreground")
-        self._schedule_foreground_check()
 
     def _schedule_status_check(self) -> None:
         if self._closed:
@@ -253,12 +224,13 @@ class WalletSyncCoordinator:
             wallet_name is not None
             and txids
             and not self._worker_active
-            and self._window_is_active()
             and now >= self._next_automatic_attempt
         ):
             due = []
             for txid in txids:
                 key = (wallet_name, txid)
+                if key in self._confirmed_transactions:
+                    continue
                 first = self._first_monitored.setdefault(key, now)
                 interval = self.policy.status_interval(now - first)
                 if now - self._last_status_check.get(key, 0.0) >= interval:
@@ -292,9 +264,3 @@ class WalletSyncCoordinator:
             for key, value in self._last_status_check.items()
             if key in active_keys
         }
-
-    def _window_is_active(self) -> bool:
-        try:
-            return self.root.winfo_exists() and self.root.state() == "normal"
-        except tk.TclError:
-            return False
