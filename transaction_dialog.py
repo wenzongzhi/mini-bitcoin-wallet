@@ -31,6 +31,9 @@ def format_transaction_time(transaction: TransactionSummary, *, detailed=False) 
 class TransactionDetailsDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, theme: Theme, transaction: TransactionSummary):
         super().__init__(parent)
+        # A new Toplevel is otherwise mapped at its default 1x1 geometry before
+        # Tk has measured the real content, which produces a visible flash.
+        self.withdraw()
         self.transaction = transaction
         self.theme = theme
         self.title("Transaction Details")
@@ -146,8 +149,24 @@ class TransactionDetailsDialog(tk.Toplevel):
         )
         close_button.grid(row=next_row, column=1, sticky="e", pady=(14, 0))
 
+        self._show_ready(parent, explorer_link)
+
+    def _show_ready(self, parent: tk.Misc, initial_focus: tk.Misc) -> None:
+        """Measure, position, and reveal the completed dialog in one frame."""
+
+        self.update_idletasks()
+        width = max(500, self.winfo_reqwidth())
+        height = max(520, self.winfo_reqheight())
+        parent.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - height) // 2
+        x = max(0, min(x, self.winfo_screenwidth() - width))
+        y = max(0, min(y, self.winfo_screenheight() - height))
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.deiconify()
+        self.lift()
         self.grab_set()
-        explorer_link.focus_set()
+        initial_focus.focus_set()
 
     def _copy_txid(self):
         self.clipboard_clear()

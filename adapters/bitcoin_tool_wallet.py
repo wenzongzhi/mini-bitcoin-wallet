@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -165,6 +166,58 @@ class BitcoinToolWalletService(WalletService):
                 return self._snapshot_for(name)
             except (WalletError, EsploraError) as exc:
                 raise ValueError(str(exc)) from exc
+
+    def _synchronize_spendable_state(self, wallet_name: str, backend) -> None:
+        """Refresh UTXOs without discarding previously cached transaction rows.
+
+        ``bitcoin-tool.sync_wallet(include_transactions=False)`` intentionally
+        skips expensive history requests, but its resulting cache contains an
+        empty transaction list.  The desktop withdrawal preflight needs fresh
+        UTXOs while Home must keep rendering its last complete history.
+        """
+
+        cached_history = self._read_cached_history(wallet_name)
+        sync_wallet(
+            wallet_name,
+            wallet_file=self.wallet_file,
+            cache_file=self.cache_file,
+            backend=backend,
+            include_transactions=False,
+            network=self.network,
+        )
+        if cached_history is not None:
+            self._restore_cached_history(wallet_name, cached_history)
+
+    def _read_cached_history(
+        self, wallet_name: str
+    ) -> tuple[list[dict], bool] | None:
+        if not self.cache_file.exists():
+            return None
+        with locked_cache_file(self.cache_file):
+            cache = load_wallet_cache(self.cache_file)
+            wallet_cache = cache.get("wallets", {}).get(wallet_name)
+            if not isinstance(wallet_cache, dict):
+                return None
+            transactions = wallet_cache.get("transactions", [])
+            if not isinstance(transactions, list):
+                raise WalletError("wallet cache transaction list is invalid")
+            complete = wallet_cache.get("transactions_complete", False)
+            return deepcopy(transactions), complete is True
+
+    def _restore_cached_history(
+        self,
+        wallet_name: str,
+        cached_history: tuple[list[dict], bool],
+    ) -> None:
+        transactions, complete = cached_history
+        with locked_cache_file(self.cache_file):
+            cache = load_wallet_cache(self.cache_file)
+            wallet_cache = cache.get("wallets", {}).get(wallet_name)
+            if not isinstance(wallet_cache, dict):
+                raise WalletError("wallet cache is missing after synchronization")
+            wallet_cache["transactions"] = transactions
+            wallet_cache["transactions_complete"] = complete
+            save_wallet_cache(cache, self.cache_file)
 
     def transaction_status(self, txid: str) -> TransactionStatus:
         """Fetch only one TXID status instead of rescanning every address."""
@@ -553,14 +606,7 @@ class BitcoinToolWalletService(WalletService):
                 [{"address": destination, "amount_sats": 1}],
                 self.network,
             )
-            sync_wallet(
-                wallet_name,
-                wallet_file=self.wallet_file,
-                cache_file=self.cache_file,
-                backend=backend,
-                include_transactions=False,
-                network=self.network,
-            )
+            self._synchronize_spendable_state(wallet_name, backend)
             if send_all:
                 funded = fund_all_transaction(
                     destination,
@@ -686,12 +732,89 @@ class BitcoinToolWalletService(WalletService):
         except (TransactionError, WalletError, EsploraError) as exc:
             raise ValueError(str(exc)) from exc
 
+        cache_warning = result.get("cache_warning")
+        if cache_warning is None:
+            try:
+                self._record_pending_transaction_summary(signed)
+            except WalletError as exc:
+                cache_warning = str(exc)
         self._prepared_withdrawals.pop(review_id, None)
         return BroadcastResult(
             txid=result["txid"],
             explorer_url=self._transaction_explorer_url(result["txid"]),
-            cache_warning=result.get("cache_warning"),
+            cache_warning=cache_warning,
         )
+
+    def _record_pending_transaction_summary(self, signed: dict) -> None:
+        """Persist an optimistic Home row immediately after accepted broadcast."""
+
+        wallet_name = signed["wallet_name"]
+        address_book = get_wallet_address_book(
+            wallet_name,
+            wallet_file=self.wallet_file,
+            network=self.network,
+        )
+        owned_addresses = {
+            item["address"]: item for item in address_book["addresses"]
+        }
+        inputs = signed["inputs"]
+        outputs = signed["outputs"]
+        sent = sum(item["value"] for item in inputs)
+        owned_outputs = [
+            item for item in outputs if item.get("address") in owned_addresses
+        ]
+        received = sum(item["value"] for item in owned_outputs)
+        net = received - sent
+        if sent and received:
+            direction = "self" if net == 0 else ("receive" if net > 0 else "send")
+        else:
+            direction = "send" if sent else "receive"
+
+        involved_addresses = {
+            item["address"] for item in inputs if item.get("address")
+        }
+        involved_addresses.update(item["address"] for item in owned_outputs)
+        involved_entries = [
+            owned_addresses[address]
+            for address in involved_addresses
+            if address in owned_addresses
+        ]
+        summary = {
+            "txid": signed["txid"],
+            "direction": direction,
+            "received": received,
+            "sent": sent,
+            "net": net,
+            "fee": signed["fee_sats"],
+            "status": {"confirmed": False},
+            "confirmed": False,
+            "confirmations": 0,
+            "addresses": sorted(involved_addresses),
+            "account_ids": sorted(
+                {item["account_id"] for item in involved_entries}
+            ),
+            "address_types": sorted(
+                {item["address_type"] for item in involved_entries}
+            ),
+        }
+        with locked_cache_file(self.cache_file):
+            cache = load_wallet_cache(self.cache_file)
+            wallet_cache = cache.get("wallets", {}).get(wallet_name)
+            if not isinstance(wallet_cache, dict):
+                raise WalletError("wallet cache is missing after broadcast")
+            transactions = wallet_cache.get("transactions", [])
+            if not isinstance(transactions, list):
+                raise WalletError("wallet cache transaction list is invalid")
+            wallet_cache["transactions"] = [
+                summary,
+                *(
+                    transaction
+                    for transaction in transactions
+                    if not isinstance(transaction, dict)
+                    or transaction.get("txid") != signed["txid"]
+                ),
+            ]
+            save_wallet_cache(cache, self.cache_file)
 
     def cancel_withdrawal(self, review_id: str) -> None:
         funded = self._funded_withdrawals.pop(review_id, None)

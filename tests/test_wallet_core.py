@@ -414,7 +414,33 @@ class BitcoinToolWalletServiceTests(TestCase):
         self.assertEqual(result.txid, review.txid)
         self.assertEqual(result.explorer_url, f"https://mempool.space/tx/{review.txid}")
         self.assertEqual(sum(item.transaction_query_count for item in backends), 0)
-        self.assertEqual(service.snapshot().pending_txids, (review.txid,))
+        snapshot = service.snapshot()
+        self.assertEqual(snapshot.pending_txids, (review.txid,))
+        self.assertEqual(snapshot.transactions[0].txid, review.txid)
+        self.assertFalse(snapshot.transactions[0].confirmed)
+
+    def test_withdrawal_utxo_sync_preserves_cached_transaction_history(self):
+        backend = FakeEsploraBackend(funded_ordinals={0: 100_000})
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "history-cache.json",
+            backend_factory=lambda _network: backend,
+        )
+        service.create_wallet("HistoryWallet", "password")
+        before = service.synchronize_wallet("HistoryWallet").transactions
+        destination = get_new_address(
+            "HistoryWallet", wallet_file=self.wallet_file, network="mainnet"
+        )["address"]
+
+        draft = service.prepare_withdrawal(
+            destination,
+            BitcoinAmount(25_000),
+            2,
+        )
+        after = service.snapshot().transactions
+
+        self.assertEqual([item.txid for item in after], [item.txid for item in before])
+        service.cancel_withdrawal(draft.draft_id)
 
     def test_full_sync_and_lightweight_transaction_status_are_separate(self):
         backend = FakeEsploraBackend(

@@ -43,6 +43,8 @@ page or widget.
   the correct mainnet or Testnet4 mempool.space link.
 - Withdrawals synchronize the active wallet, build and sign an exact transaction
   for review, and broadcast only after explicit confirmation.
+- Withdrawal UTXO synchronization preserves cached history. An accepted
+  broadcast is added to Home immediately as an unconfirmed transaction.
 - Max spends every eligible UTXO from the active wallet in one transaction; a
   cancelled review releases its temporary UTXO reservations.
 - Preset fee rates are 0/1/2/3 sat/vB; Custom selects integer rates from 0 to 20.
