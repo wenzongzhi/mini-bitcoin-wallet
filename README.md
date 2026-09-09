@@ -95,7 +95,9 @@ caches are stored beside the executable, keeping mainnet and Testnet4 isolated.
 
 ```text
 mini-bitcoin-wallet/
+├── about_dialog.py
 ├── app.py
+├── app_metadata.py
 ├── app-testnet4.py
 ├── build_mainnet.py
 ├── build_testnet4.py

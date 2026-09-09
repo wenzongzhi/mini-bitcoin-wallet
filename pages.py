@@ -21,6 +21,7 @@ from widgets import (
 )
 from transaction_dialog import format_transaction_time, show_transaction_details
 from withdrawal_dialogs import review_withdrawal
+from about_dialog import show_about_wallet
 
 
 class WalletSelector(tk.Frame):
@@ -175,6 +176,7 @@ class WalletHeader(tk.Frame):
         settings.add_separator()
         settings.add_command(label="Advanced Settings...", command=self._advanced_settings)
         menu.add_cascade(label="Settings", menu=settings)
+        menu.add_command(label="About this wallet", command=self._show_about)
         return menu
 
     def _create_wallet(self):
@@ -192,6 +194,9 @@ class WalletHeader(tk.Frame):
             "Advanced settings will be supplied as independent features.",
             parent=self.winfo_toplevel(),
         )
+
+    def _show_about(self):
+        show_about_wallet(self.winfo_toplevel(), self.theme)
 
     def _show_menu(self, event):
         try:
