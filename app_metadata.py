@@ -1,7 +1,7 @@
 """Public product metadata shown by the application and release tooling."""
 
 APP_NAME = "Mini Bitcoin Wallet"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_DESCRIPTION = (
     "A lightweight self-custodial Bitcoin desktop wallet for "
     "Mainnet and Testnet4."

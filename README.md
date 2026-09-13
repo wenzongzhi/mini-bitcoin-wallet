@@ -1,8 +1,8 @@
 # Mini Bitcoin Wallet
 
 Desktop Bitcoin wallet built with Python and Tkinter. It supports mainnet and
-Testnet4 while reusing the wallet, network, and Bitcoin primitives copied from
-`bitcoin-tool`.
+Testnet4 and uses the copied `bitcoin-tool` Platform API for wallet and payment
+operations.
 
 ## Design principles
 
@@ -19,15 +19,19 @@ app.py (composition root)
   ├─ sync_coordinator.py                    background refresh policy
   ├─ wallet_core/application.py             use cases
   ├─ wallet_core/models.py + ports.py       domain values and interfaces
-  ├─ adapters/bitcoin_tool_wallet.py        production adapter
-  └─ btc/ + wallet/ + network/ + tx/        copied bitcoin-tool implementation
+  ├─ adapters/bitcoin_tool_wallet.py        Platform DTO → GUI model mapping
+  └─ wallet/service.py + tx/service.py      bitcoin-tool Platform API
 ```
 
-The copied `bitcoin-tool` packages are accessed through
-`BitcoinToolWalletService`. The adapter owns network selection, wallet paths,
-synchronization, and conversion to domain models. New features should be added
-in this order: domain model, service port, application use case, UI state, then
-page or widget.
+The GUI adapter may import `wallet.service` and `tx.service`, but must not import
+`wallet_cache` or `tx.workflow`. Wallet JSON parsing, address discovery,
+synchronization, transaction accounting, UTXO reservations, and payment
+lifecycles belong to those Platform services. The adapter stores only the
+product's active-wallet preference and maps Platform DTOs to view models.
+
+Product choices stay in the UI layer. For example, Platform transaction DTOs
+contain `network` and `txid`; `explorer_links.py` turns them into the chosen
+mempool.space URL.
 
 ## Wallet setup behavior
 
@@ -36,6 +40,8 @@ page or widget.
 - Wallet creation and BIP39 import require a wallet name and password.
 - Multiple wallets can be listed and switched without entering a password. The
   active wallet for each network is remembered in non-secret `settings.json`.
+- Wallet Settings can display recovery words, rename a wallet, replace its
+  password, or remove it after ownership confirmation.
 - Imported wallets scan 20 receive and 20 change addresses. The next unused
   receive address is displayed after synchronization.
 - Balance and history include both receive and change addresses.
@@ -110,6 +116,7 @@ mini-bitcoin-wallet/
 ├── wallet/
 ├── wallet_core/
 ├── wallet_manager.py
+├── wallet_settings_dialog.py
 ├── tests/
 ├── requirements.txt
 └── README.md

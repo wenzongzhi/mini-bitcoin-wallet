@@ -6,6 +6,7 @@ from unittest import TestCase
 from adapters import BitcoinToolWalletService, DemoWalletService
 from app_settings import ApplicationSettingsStore
 from btc.chainparams import NETWORK_TESTNET4
+from explorer_links import transaction_explorer_url
 from tx.codec import deserialize_transaction_hex, transaction_txid
 from wallet_core import BitcoinAmount, DisplayUnit, WalletApplication
 from wallet import get_new_address, get_wallet_address_book
@@ -343,7 +344,11 @@ class BitcoinToolWalletServiceTests(TestCase):
         self.assertEqual(first_transaction.confirmations, 11)
         self.assertTrue(first_transaction.confirmed)
         self.assertEqual(first_transaction.block_height, 90)
-        self.assertTrue(first_transaction.explorer_url.startswith("https://mempool.space/tx/"))
+        self.assertEqual(first_transaction.network, "mainnet")
+        self.assertTrue(
+            transaction_explorer_url(first_transaction.network, first_transaction.txid)
+            .startswith("https://mempool.space/tx/")
+        )
 
     def test_testnet4_wallet_uses_an_isolated_tb1_receive_address(self):
         data_directory = Path(self.temporary_directory.name)
@@ -375,9 +380,10 @@ class BitcoinToolWalletServiceTests(TestCase):
         self.assertEqual(restored.snapshot.balance.sats, 9_000)
         self.assertEqual(len(restored.snapshot.transactions), 2)
         self.assertTrue(
-            restored.snapshot.transactions[0].explorer_url.startswith(
-                "https://mempool.space/testnet4/tx/"
-            )
+            transaction_explorer_url(
+                restored.snapshot.transactions[0].network,
+                restored.snapshot.transactions[0].txid,
+            ).startswith("https://mempool.space/testnet4/tx/")
         )
 
     def test_selected_wallet_prepares_and_broadcasts_withdrawal(self):
@@ -412,7 +418,10 @@ class BitcoinToolWalletServiceTests(TestCase):
         self.assertGreater(review.fee.sats, 0)
         result = service.broadcast_withdrawal(review.review_id)
         self.assertEqual(result.txid, review.txid)
-        self.assertEqual(result.explorer_url, f"https://mempool.space/tx/{review.txid}")
+        self.assertEqual(
+            transaction_explorer_url(result.network, result.txid),
+            f"https://mempool.space/tx/{review.txid}",
+        )
         self.assertEqual(sum(item.transaction_query_count for item in backends), 0)
         snapshot = service.snapshot()
         self.assertEqual(snapshot.pending_txids, (review.txid,))
@@ -543,6 +552,48 @@ class BitcoinToolWalletServiceTests(TestCase):
 
         self.assertEqual(review.network, NETWORK_TESTNET4)
         self.assertEqual(
-            result.explorer_url,
+            transaction_explorer_url(result.network, result.txid),
             f"https://mempool.space/testnet4/tx/{review.txid}",
         )
+
+    def test_wallet_lifecycle_preserves_secret_and_cache_until_removal(self):
+        backend = FakeEsploraBackend(funded_ordinals={0: 12_345})
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "lifecycle-cache.json",
+            backend_factory=lambda _network: backend,
+        )
+        creation = service.create_wallet("Before", "old-password")
+        service.synchronize_wallet("Before")
+
+        renamed = service.rename_wallet("After", "old-password")
+        self.assertEqual(renamed.name, "After")
+        self.assertEqual(renamed.balance.sats, 12_345)
+        self.assertEqual(service.get_mnemonic("old-password"), creation.mnemonic)
+        self.assertEqual([wallet.name for wallet in service.list_wallets()], ["After"])
+
+        service.change_password("old-password", "new-password")
+        with self.assertRaises(ValueError):
+            service.get_mnemonic("old-password")
+        self.assertEqual(service.get_mnemonic("new-password"), creation.mnemonic)
+
+        service.remove_wallet("new-password")
+        self.assertFalse(service.snapshot().is_initialized)
+        cache = json.loads(
+            (self.wallet_file.parent / "lifecycle-cache.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertNotIn("After", cache["wallets"])
+
+    def test_wallet_lifecycle_rejects_wrong_password_without_mutation(self):
+        self.service.create_wallet("Protected", "correct-password")
+
+        with self.assertRaises(ValueError):
+            self.service.rename_wallet("Changed", "wrong-password")
+        with self.assertRaises(ValueError):
+            self.service.change_password("wrong-password", "new-password")
+        with self.assertRaises(ValueError):
+            self.service.remove_wallet("wrong-password")
+
+        self.assertEqual([wallet.name for wallet in self.service.list_wallets()], ["Protected"])

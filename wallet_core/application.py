@@ -49,11 +49,28 @@ class WalletApplication:
             raise ValueError("Transaction ID must be 64 hexadecimal characters.")
         return self._service.transaction_status(normalized)
 
-    def rename_wallet(self, name: str) -> WalletSnapshot:
+    def get_mnemonic(self, password: str | None) -> str:
+        return self._service.get_mnemonic(password)
+
+    def rename_wallet(
+        self, name: str, password: str | None = None
+    ) -> WalletSnapshot:
         normalized = name.strip()
         if not normalized:
             raise ValueError("Wallet name cannot be empty.")
-        return self._service.rename_wallet(normalized)
+        return self._service.rename_wallet(normalized, password)
+
+    def change_password(
+        self,
+        current_password: str | None,
+        new_password: str,
+    ) -> WalletSnapshot:
+        if not new_password:
+            raise ValueError("New password cannot be empty.")
+        return self._service.change_password(current_password, new_password)
+
+    def remove_wallet(self, password: str | None) -> WalletSnapshot:
+        return self._service.remove_wallet(password)
 
     def create_wallet(
         self, name: str, password: str, mnemonic: str | None = None

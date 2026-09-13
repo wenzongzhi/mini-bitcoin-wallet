@@ -45,6 +45,7 @@ class DemoWalletService(WalletService):
         )
         return TransactionSummary(
             txid=txid,
+            network="mainnet",
             amount=BitcoinAmount(sats),
             direction=direction,
             received=BitcoinAmount(max(sats, 0)),
@@ -57,7 +58,6 @@ class DemoWalletService(WalletService):
             addresses=(),
             account_ids=(),
             address_types=("P2WPKH",),
-            explorer_url="",
         )
 
     def snapshot(self) -> WalletSnapshot:
@@ -83,8 +83,29 @@ class DemoWalletService(WalletService):
     def transaction_status(self, txid: str) -> TransactionStatus:
         return TransactionStatus(txid=txid, confirmed=True, block_height=1)
 
-    def rename_wallet(self, name: str) -> WalletSnapshot:
+    def get_mnemonic(self, password: str | None) -> str:
+        return "demo mnemonic"
+
+    def rename_wallet(
+        self, name: str, password: str | None = None
+    ) -> WalletSnapshot:
         self._snapshot = replace(self._snapshot, name=name)
+        return self._snapshot
+
+    def change_password(
+        self,
+        current_password: str | None,
+        new_password: str,
+    ) -> WalletSnapshot:
+        return self._snapshot
+
+    def remove_wallet(self, password: str | None) -> WalletSnapshot:
+        self._snapshot = WalletSnapshot(
+            name="No Wallet",
+            balance=BitcoinAmount(0),
+            receive_address="",
+            is_initialized=False,
+        )
         return self._snapshot
 
     def create_wallet(
@@ -164,7 +185,7 @@ class DemoWalletService(WalletService):
     def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:
         if review_id != "demo-review":
             raise ValueError("Withdrawal review does not exist.")
-        return BroadcastResult("0" * 64, "")
+        return BroadcastResult("0" * 64, self._snapshot.network)
 
     def cancel_withdrawal(self, review_id: str) -> None:
         if review_id == "demo-review":

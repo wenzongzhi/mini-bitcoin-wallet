@@ -45,8 +45,26 @@ class WalletService(ABC):
         """Fetch one transaction's confirmation status without scanning addresses."""
 
     @abstractmethod
-    def rename_wallet(self, name: str) -> WalletSnapshot:
+    def get_mnemonic(self, password: str | None) -> str:
+        """Unlock and return the active wallet's recovery words."""
+
+    @abstractmethod
+    def rename_wallet(
+        self, name: str, password: str | None = None
+    ) -> WalletSnapshot:
         """Rename the wallet and return its updated snapshot."""
+
+    @abstractmethod
+    def change_password(
+        self,
+        current_password: str | None,
+        new_password: str,
+    ) -> WalletSnapshot:
+        """Replace the active wallet's encryption password."""
+
+    @abstractmethod
+    def remove_wallet(self, password: str | None) -> WalletSnapshot:
+        """Remove the active wallet and return the next active snapshot."""
 
     @abstractmethod
     def create_wallet(

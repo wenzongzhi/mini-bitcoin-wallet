@@ -8,6 +8,7 @@ import webbrowser
 from tkinter import messagebox
 from urllib.parse import urlparse
 
+from explorer_links import transaction_explorer_url
 from theme import Theme
 from wallet_core import DisplayUnit, TransactionDirection, TransactionSummary
 from app_assets import apply_window_icon
@@ -166,7 +167,10 @@ class TransactionDetailsDialog(tk.Toplevel):
         self.after(1000, lambda: self.copy_button.configure(text="Copy"))
 
     def _open_explorer(self, _event=None):
-        url = self.transaction.explorer_url
+        url = transaction_explorer_url(
+            self.transaction.network,
+            self.transaction.txid,
+        )
         parsed = urlparse(url)
         if (
             not re.fullmatch(r"[0-9a-fA-F]{64}", self.transaction.txid)

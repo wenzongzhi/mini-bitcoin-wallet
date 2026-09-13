@@ -64,6 +64,7 @@ class TransactionSummary:
     """Complete wallet-facing metadata for one synchronized transaction."""
 
     txid: str
+    network: str
     amount: BitcoinAmount
     direction: TransactionDirection
     received: BitcoinAmount
@@ -76,7 +77,6 @@ class TransactionSummary:
     addresses: tuple[str, ...]
     account_ids: tuple[str, ...]
     address_types: tuple[str, ...]
-    explorer_url: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +158,7 @@ class BroadcastResult:
     """Public result returned after a transaction broadcast attempt succeeds."""
 
     txid: str
-    explorer_url: str
+    network: str
     cache_warning: str | None = None
 
 

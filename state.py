@@ -83,9 +83,27 @@ class WalletUIState:
     def formatted_balance(self) -> tuple[str, str]:
         return self._snapshot.balance.format(self.unit), self.unit.value
 
-    def rename_wallet(self, name: str) -> None:
-        self._snapshot = self.application.rename_wallet(name)
-        self.wallet_name.set(self._snapshot.name)
+    def get_mnemonic(self, password: str | None) -> str:
+        return self.application.get_mnemonic(password)
+
+    def rename_wallet(self, name: str, password: str | None = None) -> None:
+        self._apply_snapshot(self.application.rename_wallet(name, password))
+
+    def change_password(
+        self,
+        current_password: str | None,
+        new_password: str,
+    ) -> None:
+        self._apply_snapshot(
+            self.application.change_password(current_password, new_password)
+        )
+
+    def remove_wallet(self, password: str | None) -> None:
+        self.amount.set("")
+        self.address.set("")
+        self.send_all.set(False)
+        self._apply_snapshot(self.application.remove_wallet(password))
+        self._announce("<<ActiveWalletChanged>>")
 
     def create_wallet(
         self, name: str, password: str, mnemonic: str | None = None

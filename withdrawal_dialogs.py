@@ -9,6 +9,7 @@ from tkinter import messagebox, simpledialog, ttk
 from typing import Callable
 
 from app_assets import apply_window_icon
+from explorer_links import transaction_explorer_url
 from state import WalletUIState
 from theme import Theme
 from wallet_core import BroadcastResult, WithdrawalDraft, WithdrawalReview
@@ -197,7 +198,9 @@ def _broadcast_withdrawal(
         warning = f"\n\nWarning: {result.cache_warning}" if result.cache_warning else ""
         messagebox.showinfo(
             "Withdrawal Broadcast",
-            f"Transaction accepted.\n\nTXID: {result.txid}\n{result.explorer_url}{warning}",
+            "Transaction accepted.\n\n"
+            f"TXID: {result.txid}\n"
+            f"{transaction_explorer_url(result.network, result.txid)}{warning}",
             parent=parent,
         )
 

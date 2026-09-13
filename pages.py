@@ -7,6 +7,7 @@ from state import WalletUIState
 from wallet_core import DisplayUnit, TransactionDirection, TransactionSummary
 from wallet_dialogs import create_new_wallet, import_wallet
 from wallet_manager import show_wallet_manager
+from wallet_settings_dialog import show_wallet_settings
 from widgets import (
     AmountEntry,
     BitcoinLogo,
@@ -174,7 +175,7 @@ class WalletHeader(tk.Frame):
         settings.add_cascade(label="Fiat currency", menu=fiat)
         settings.add_checkbutton(label="Dark mode", variable=self.state.dark_mode)
         settings.add_separator()
-        settings.add_command(label="Advanced Settings...", command=self._advanced_settings)
+        settings.add_command(label="Wallet Settings...", command=self._wallet_settings)
         menu.add_cascade(label="Settings", menu=settings)
         menu.add_command(label="About this wallet", command=self._show_about)
         return menu
@@ -188,12 +189,8 @@ class WalletHeader(tk.Frame):
     def _manage_wallets(self):
         show_wallet_manager(self.winfo_toplevel(), self.theme, self.state)
 
-    def _advanced_settings(self):
-        messagebox.showinfo(
-            "Advanced Settings",
-            "Advanced settings will be supplied as independent features.",
-            parent=self.winfo_toplevel(),
-        )
+    def _wallet_settings(self):
+        show_wallet_settings(self.winfo_toplevel(), self.theme, self.state)
 
     def _show_about(self):
         show_about_wallet(self.winfo_toplevel(), self.theme)
