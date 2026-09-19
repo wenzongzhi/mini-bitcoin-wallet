@@ -7,20 +7,16 @@ from decimal import Decimal
 from threading import RLock
 
 from network import EsploraError
-from wallet import WalletError, get_wallet_address_book
+from wallet import WalletError
 from wallet.service import WalletService
-from wallet.transaction_accounting import (
-    pending_summary_from_signed,
-    upsert_cached_transaction,
-)
-from wallet.wallet_cache import load_wallet_cache, locked_cache_file, save_wallet_cache
-
 from .builder import create_raw_transaction
 from .errors import TransactionError
 from .workflow import (
     broadcast_signed_transaction,
+    cancel_transaction_draft,
     fund_all_transaction,
     fund_transaction,
+    release_transaction_draft,
     sign_funded_transaction,
 )
 
@@ -237,27 +233,9 @@ class PaymentService:
                 self.wallet_service.network,
                 backend,
                 cache_file=self.wallet_service.cache_file,
+                wallet_file=self.wallet_service.wallet_file,
             )
             cache_warning = result.get("cache_warning")
-            if cache_warning is None:
-                try:
-                    address_book = get_wallet_address_book(
-                        signed["wallet_name"],
-                        wallet_file=self.wallet_service.wallet_file,
-                        network=self.wallet_service.network,
-                    )
-                    owned = {
-                        item["address"]: item
-                        for item in address_book["addresses"]
-                    }
-                    summary = pending_summary_from_signed(signed, owned)
-                    upsert_cached_transaction(
-                        signed["wallet_name"],
-                        summary,
-                        self.wallet_service.cache_file,
-                    )
-                except WalletError as exc:
-                    cache_warning = str(exc)
             self._signed.pop(payment_id, None)
             return BroadcastReceipt(
                 result["txid"],
@@ -266,7 +244,7 @@ class PaymentService:
             )
 
     def cancel(self, payment_id: str) -> None:
-        """Cancel either a funded or signed payment and release its reservation."""
+        """Cancel an active payment without ever reclaiming ISSUED change."""
 
         with self._lock:
             funded = self._funded.pop(payment_id, None)
@@ -279,26 +257,19 @@ class PaymentService:
                     document["wallet_name"],
                     document.get("draft_id"),
                 )
+            else:
+                cancel_transaction_draft(
+                    self.wallet_service.cache_file,
+                    payment_id,
+                )
 
     def release_reservation(self, wallet_name: str, draft_id: str | None) -> None:
         """Public, idempotent release API for abandoned platform drafts."""
 
         if not draft_id or not self.wallet_service.cache_file.exists():
             return
-        with locked_cache_file(self.wallet_service.cache_file):
-            cache = load_wallet_cache(self.wallet_service.cache_file)
-            wallet_cache = cache.get("wallets", {}).get(wallet_name)
-            if not isinstance(wallet_cache, dict):
-                return
-            reservations = wallet_cache.get("reserved_outpoints", {})
-            if not isinstance(reservations, dict):
-                raise TransactionError("wallet UTXO reservations are invalid")
-            remaining = {
-                outpoint: reservation
-                for outpoint, reservation in reservations.items()
-                if not isinstance(reservation, dict)
-                or reservation.get("draft_id") != draft_id
-            }
-            if remaining != reservations:
-                wallet_cache["reserved_outpoints"] = remaining
-                save_wallet_cache(cache, self.wallet_service.cache_file)
+        release_transaction_draft(
+            self.wallet_service.cache_file,
+            wallet_name,
+            draft_id,
+        )

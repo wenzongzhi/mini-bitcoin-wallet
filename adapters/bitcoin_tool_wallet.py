@@ -16,6 +16,7 @@ from wallet.service import WalletMetadata as PlatformWalletMetadata
 from wallet.service import WalletService as PlatformWalletService
 from wallet.service import WalletState as PlatformWalletState
 from wallet_core.models import (
+    AddressDiscoverySummary,
     BitcoinAmount,
     BroadcastResult,
     SendPreview,
@@ -106,6 +107,11 @@ class BitcoinToolWalletService(WalletService):
                 name="No Wallet",
                 balance=BitcoinAmount(0),
                 receive_address="",
+                authoritative_balance=BitcoinAmount(0),
+                confirmed_balance=BitcoinAmount(0),
+                unconfirmed_chain_balance=BitcoinAmount(0),
+                pending_delta=BitcoinAmount(0),
+                available_balance=BitcoinAmount(0),
                 network=self.network,
                 transactions=(),
                 is_initialized=False,
@@ -124,6 +130,7 @@ class BitcoinToolWalletService(WalletService):
         mnemonic: str | None = None,
     ) -> WalletCreation:
         imported = mnemonic is not None
+        existed_before_import = imported and self._platform_wallet_exists(name)
         try:
             creation = (
                 self.platform_wallet.import_wallet(name, password, mnemonic)
@@ -131,18 +138,41 @@ class BitcoinToolWalletService(WalletService):
                 else self.platform_wallet.create_wallet(name, password)
             )
         except WalletError as exc:
-            if imported and self._platform_wallet_exists(name):
-                self._activate_wallet(name)
+            if (
+                imported
+                and not existed_before_import
+                and self._platform_wallet_exists(name)
+            ):
+                try:
+                    # Discovery is part of import. Roll back the new record so
+                    # a temporary backend failure can be retried with the same
+                    # wallet name and mnemonic instead of leaving an address
+                    # book that looks initialized but is incomplete.
+                    self.platform_wallet.remove_wallet(name, password)
+                except WalletError as cleanup_error:
+                    raise ValueError(
+                        "Wallet import and automatic cleanup both failed. "
+                        f"Import error: {exc}. Cleanup error: {cleanup_error}"
+                    ) from cleanup_error
                 raise ValueError(
-                    "Wallet was imported, but its address scan could not complete: "
-                    f"{exc}"
+                    "Wallet import was not saved because address discovery "
+                    f"could not complete: {exc}"
                 ) from exc
             raise ValueError(str(exc)) from exc
         self._activate_wallet(name)
+        discovery = None
+        if creation.discovery is not None:
+            discovery = AddressDiscoverySummary(
+                receive_scanned=creation.discovery.receive.scanned_count,
+                change_scanned=creation.discovery.change.scanned_count,
+                receive_used=len(creation.discovery.receive.used_indexes),
+                change_used=len(creation.discovery.change.used_indexes),
+            )
         return WalletCreation(
             self._wallet_snapshot(creation.state),
             creation.mnemonic,
             creation.imported,
+            discovery,
         )
 
     def get_mnemonic(self, password: str | None) -> str:
@@ -265,7 +295,10 @@ class BitcoinToolWalletService(WalletService):
         )
 
     def cancel_withdrawal(self, review_id: str) -> None:
-        self.platform_payment.cancel(review_id)
+        try:
+            self.platform_payment.cancel(review_id)
+        except (TransactionError, WalletError) as exc:
+            raise ValueError(str(exc)) from exc
 
     def _activate_wallet(self, name: str) -> None:
         self._wallet_name = name
@@ -287,8 +320,15 @@ class BitcoinToolWalletService(WalletService):
     def _wallet_snapshot(self, state: PlatformWalletState) -> WalletSnapshot:
         return WalletSnapshot(
             name=state.metadata.name,
-            balance=BitcoinAmount(state.balance_sats),
+            balance=BitcoinAmount(state.effective_balance_sats),
             receive_address=state.receive_address,
+            authoritative_balance=BitcoinAmount(state.authoritative_balance_sats),
+            confirmed_balance=BitcoinAmount(state.confirmed_balance_sats),
+            unconfirmed_chain_balance=BitcoinAmount(
+                state.unconfirmed_chain_balance_sats
+            ),
+            pending_delta=BitcoinAmount(state.pending_delta_sats),
+            available_balance=BitcoinAmount(state.available_balance_sats),
             network=state.metadata.network,
             transactions=tuple(
                 self._transaction_summary(transaction)

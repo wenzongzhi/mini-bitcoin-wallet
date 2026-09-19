@@ -27,6 +27,7 @@ from btc.chainparams import NETWORK_MAINNET, get_chain_params
 DEFAULT_ESPLORA_URL = get_chain_params(NETWORK_MAINNET).default_esplora_url
 MAX_RESPONSE_SIZE = 10 * 1024 * 1024
 RETRYABLE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
+MAX_TRANSACTION_HISTORY_PAGES = 10_000
 
 
 class EsploraError(Exception):
@@ -169,6 +170,99 @@ class EsploraBackend:
         if not isinstance(data, list):
             raise EsploraError("invalid address transaction response")
         return data
+
+    def get_all_address_transactions(self, address: str) -> list[dict]:
+        """Return complete mempool and confirmed history for one address.
+
+        Esplora's first page contains mempool transactions followed by recent
+        confirmed transactions.  Older confirmed pages are traversed with the
+        last confirmed txid as the cursor.  Results retain backend order while
+        duplicate txids are collapsed; a confirmed representation replaces an
+        earlier mempool representation of the same transaction.
+        """
+
+        encoded_address = quote(address, safe="")
+        try:
+            first_page = self._get_json(f"/address/{encoded_address}/txs")
+        except EsploraError as exc:
+            raise EsploraError(
+                f"cannot retrieve complete transaction history for {address}: {exc}"
+            ) from exc
+        if not isinstance(first_page, list):
+            raise EsploraError("invalid address transaction response")
+
+        ordered: list[dict] = []
+        positions: dict[str, int] = {}
+
+        def add_page(page: list, *, chain_page: bool) -> str | None:
+            last_confirmed_txid = None
+            for transaction in page:
+                txid, confirmed = self._validate_history_transaction(transaction)
+                if chain_page and not confirmed:
+                    raise EsploraError(
+                        "invalid confirmed transaction pagination response"
+                    )
+                existing_position = positions.get(txid)
+                if existing_position is None:
+                    positions[txid] = len(ordered)
+                    ordered.append(transaction)
+                elif confirmed and not self._history_transaction_confirmed(
+                    ordered[existing_position]
+                ):
+                    ordered[existing_position] = transaction
+                if confirmed:
+                    last_confirmed_txid = txid
+            return last_confirmed_txid
+
+        cursor = add_page(first_page, chain_page=False)
+        seen_cursors: set[str] = set()
+        page_count = 1
+        while cursor is not None:
+            if cursor in seen_cursors:
+                raise EsploraError("transaction history pagination did not advance")
+            if page_count >= MAX_TRANSACTION_HISTORY_PAGES:
+                raise EsploraError("transaction history pagination safety limit reached")
+            seen_cursors.add(cursor)
+            path = f"/address/{encoded_address}/txs/chain/{cursor}"
+            try:
+                page = self._get_json(path)
+            except EsploraError as exc:
+                raise EsploraError(
+                    f"cannot complete transaction history for {address}: {exc}"
+                ) from exc
+            if not isinstance(page, list):
+                raise EsploraError("invalid confirmed transaction pagination response")
+            if not page:
+                break
+            next_cursor = add_page(page, chain_page=True)
+            if next_cursor is None:
+                raise EsploraError("confirmed transaction page has no valid cursor")
+            cursor = next_cursor
+            page_count += 1
+        return ordered
+
+    @staticmethod
+    def _history_transaction_confirmed(transaction: dict) -> bool:
+        status = transaction.get("status")
+        return isinstance(status, dict) and status.get("confirmed") is True
+
+    @classmethod
+    def _validate_history_transaction(cls, transaction: object) -> tuple[str, bool]:
+        if not isinstance(transaction, dict):
+            raise EsploraError("invalid transaction in address history response")
+        txid = transaction.get("txid")
+        status = transaction.get("status")
+        if (
+            not isinstance(txid, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", txid)
+            or not isinstance(status, dict)
+            or not isinstance(status.get("confirmed"), bool)
+        ):
+            raise EsploraError("invalid transaction in address history response")
+        normalized_txid = txid.lower()
+        if normalized_txid != txid:
+            transaction["txid"] = normalized_txid
+        return normalized_txid, cls._history_transaction_confirmed(transaction)
 
     def get_transaction_hex(self, txid: str) -> str:
         if not isinstance(txid, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", txid):

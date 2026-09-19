@@ -1,7 +1,7 @@
 """Wallet funding, signing, reservation, and broadcast state workflows."""
 
 from copy import deepcopy
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 import uuid
@@ -9,14 +9,22 @@ import uuid
 from wallet import (
     WalletError,
     WalletSigningSession,
-    get_new_address,
     get_wallet_address_book,
+)
+from wallet.wallet import (
+    derive_next_change_address_candidate,
+    derive_wallet_address_candidate,
+    issue_change_address,
 )
 from wallet.wallet_cache import (
     load_wallet_cache,
     locked_cache_file,
     save_wallet_cache,
     utc_now,
+)
+from wallet.transaction_accounting import (
+    calculate_wallet_balance,
+    pending_summary_from_signed,
 )
 
 from .builder import transaction_output_metadata
@@ -46,9 +54,6 @@ from .signer import sign_transaction
 from .verifier import verify_all_inputs
 
 
-RESERVATION_TTL_SECONDS = 3600
-
-
 def _parse_timestamp(value: str, field: str) -> datetime:
     if not isinstance(value, str):
         raise TransactionError(f"wallet cache {field} timestamp is invalid")
@@ -62,16 +67,86 @@ def _parse_timestamp(value: str, field: str) -> datetime:
 
 
 def _cleanup_reservations(wallet_cache: dict, now: datetime) -> dict:
+    """Validate UTXO reservations without expiring active payment state."""
+
+    del now
     reservations = wallet_cache.setdefault("reserved_outpoints", {})
     if not isinstance(reservations, dict):
         raise TransactionError("wallet cache reservations are invalid")
-    cutoff = now - timedelta(seconds=RESERVATION_TTL_SECONDS)
-    return {
-        outpoint: reservation
-        for outpoint, reservation in reservations.items()
-        if isinstance(reservation, dict)
-        and _parse_timestamp(reservation.get("reserved_at"), "reservation") >= cutoff
+    validated = {}
+    for outpoint, reservation in reservations.items():
+        if not isinstance(reservation, dict):
+            raise TransactionError("wallet cache reservation entry is invalid")
+        _parse_timestamp(reservation.get("reserved_at"), "reservation")
+        if not isinstance(reservation.get("draft_id"), str):
+            raise TransactionError("wallet cache reservation draft id is invalid")
+        validated[outpoint] = reservation
+    return validated
+
+
+def _validated_reserved_change(wallet_cache: dict) -> dict | None:
+    """Read the optional minimal change reservation from cache."""
+
+    reservation = wallet_cache.get("reserved_change")
+    if reservation is None:
+        return None
+    if not isinstance(reservation, dict):
+        raise TransactionError("wallet change-address reservation is invalid")
+    draft_id = reservation.get("draft_id")
+    address_type = reservation.get("address_type")
+    index = reservation.get("index")
+    if not isinstance(draft_id, str) or not draft_id:
+        raise TransactionError("wallet change-address reservation draft id is invalid")
+    if str(address_type).lower() not in {"p2pkh", "p2wpkh"}:
+        raise TransactionError("wallet change-address reservation type is invalid")
+    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < 2**31:
+        raise TransactionError("wallet change-address reservation index is invalid")
+    _parse_timestamp(reservation.get("reserved_at"), "change reservation")
+    return reservation
+
+
+def _active_draft_ids(wallet_cache: dict) -> set[str]:
+    """Return draft ids inferred from the two reservation fields."""
+
+    reservations = wallet_cache.get("reserved_outpoints", {})
+    if not isinstance(reservations, dict):
+        raise TransactionError("wallet cache reservations are invalid")
+    draft_ids = {
+        item["draft_id"]
+        for item in reservations.values()
+        if isinstance(item, dict) and isinstance(item.get("draft_id"), str)
     }
+    reserved_change = _validated_reserved_change(wallet_cache)
+    if reserved_change is not None:
+        draft_ids.add(reserved_change["draft_id"])
+    return draft_ids
+
+
+def _require_no_active_draft(wallet_cache: dict) -> None:
+    if _active_draft_ids(wallet_cache):
+        raise TransactionError("wallet already has an active payment draft")
+
+
+def _cancel_draft_in_wallet_cache(wallet_cache: dict, draft_id: str) -> bool:
+    """Release one draft; an address already issued in wallets.json is untouched."""
+
+    changed = False
+    reservations = wallet_cache.get("reserved_outpoints", {})
+    if not isinstance(reservations, dict):
+        raise TransactionError("wallet cache reservations are invalid")
+    retained = {
+        outpoint: item
+        for outpoint, item in reservations.items()
+        if not isinstance(item, dict) or item.get("draft_id") != draft_id
+    }
+    if retained != reservations:
+        changed = True
+        wallet_cache["reserved_outpoints"] = retained
+    reserved_change = wallet_cache.get("reserved_change")
+    if isinstance(reserved_change, dict) and reserved_change.get("draft_id") == draft_id:
+        wallet_cache.pop("reserved_change", None)
+        changed = True
+    return changed
 
 
 def _release_draft(cache_file: Path, wallet_name: str, draft_id: str) -> None:
@@ -80,14 +155,107 @@ def _release_draft(cache_file: Path, wallet_name: str, draft_id: str) -> None:
         wallet_cache = cache.get("wallets", {}).get(wallet_name)
         if not isinstance(wallet_cache, dict):
             return
-        reservations = wallet_cache.get("reserved_outpoints", {})
-        if isinstance(reservations, dict):
-            wallet_cache["reserved_outpoints"] = {
-                outpoint: item
-                for outpoint, item in reservations.items()
-                if not isinstance(item, dict) or item.get("draft_id") != draft_id
-            }
+        if _cancel_draft_in_wallet_cache(wallet_cache, draft_id):
             save_wallet_cache(cache, cache_file)
+
+
+def release_transaction_draft(
+    cache_file: Path,
+    wallet_name: str,
+    draft_id: str,
+) -> None:
+    """Idempotently release a payment draft's UTXOs and RESERVED change."""
+
+    _release_draft(cache_file, wallet_name, draft_id)
+
+
+def cancel_transaction_draft(
+    cache_file: Path,
+    draft_id: str,
+    wallet_name: str | None = None,
+) -> bool:
+    """Cancel a draft after restart, optionally locating its wallet by id."""
+
+    with locked_cache_file(cache_file):
+        cache = load_wallet_cache(cache_file)
+        wallets = cache.get("wallets", {})
+        if not isinstance(wallets, dict):
+            raise TransactionError("wallet cache is invalid")
+        candidates = [wallet_name] if wallet_name is not None else list(wallets)
+        matches = []
+        for candidate in candidates:
+            wallet_cache = wallets.get(candidate)
+            if not isinstance(wallet_cache, dict):
+                continue
+            reservations = wallet_cache.get("reserved_outpoints", {})
+            if not isinstance(reservations, dict):
+                raise TransactionError("wallet cache reservations are invalid")
+            has_inputs = any(
+                isinstance(item, dict) and item.get("draft_id") == draft_id
+                for item in reservations.values()
+            )
+            reserved_change = wallet_cache.get("reserved_change")
+            has_change = (
+                isinstance(reserved_change, dict)
+                and reserved_change.get("draft_id") == draft_id
+            )
+            if has_inputs or has_change:
+                matches.append((candidate, wallet_cache))
+        if len(matches) > 1:
+            raise TransactionError("payment draft id is ambiguous across wallets")
+        if not matches:
+            return False
+        _, wallet_cache = matches[0]
+        changed = _cancel_draft_in_wallet_cache(wallet_cache, draft_id)
+        if changed:
+            save_wallet_cache(cache, cache_file)
+        return changed
+
+
+def _reserve_change_address(
+    wallet_name: str,
+    draft_id: str,
+    wallet_file: Path,
+    cache_file: Path,
+    *,
+    address_type: str,
+    network: str,
+) -> dict:
+    """Reserve the current change index without writing it to wallets.json."""
+
+    with locked_cache_file(cache_file):
+        cache = load_wallet_cache(cache_file)
+        wallet_cache = cache.get("wallets", {}).get(wallet_name)
+        if not isinstance(wallet_cache, dict):
+            raise TransactionError("wallet cache is missing while reserving change")
+        if wallet_cache.get("reserved_change") is not None:
+            _validated_reserved_change(wallet_cache)
+            raise TransactionError("wallet change address is already reserved")
+        reservations = wallet_cache.get("reserved_outpoints", {})
+        if not isinstance(reservations, dict):
+            raise TransactionError("wallet cache reservations are invalid")
+        if not any(
+            isinstance(item, dict) and item.get("draft_id") == draft_id
+            for item in reservations.values()
+        ):
+            raise TransactionError("payment draft has no reserved inputs")
+        try:
+            candidate = derive_next_change_address_candidate(
+                wallet_name,
+                wallet_file=wallet_file,
+                address_type=address_type,
+                network=network,
+            )
+        except WalletError as exc:
+            raise TransactionError(str(exc)) from exc
+        wallet_cache["reserved_change"] = {
+            "draft_id": draft_id,
+            "address_type": candidate["address_type"],
+            "index": candidate["index"],
+            "reserved_at": utc_now(),
+        }
+        save_wallet_cache(cache, cache_file)
+    return candidate
 
 
 def fund_transaction(
@@ -135,9 +303,12 @@ def fund_transaction(
                 f"wallet cache is stale ({cache_age} seconds old); run syncwallet or increase max cache age"
             )
         active_reservations = _cleanup_reservations(wallet_cache, now)
+        wallet_cache["reserved_outpoints"] = active_reservations
+        _require_no_active_draft(wallet_cache)
         pending_spent = wallet_cache.get("pending_spent_outpoints", {})
         if not isinstance(pending_spent, dict):
             raise TransactionError("wallet pending-spent outpoints are invalid")
+        reserved_at = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         selection = select_coins(
             wallet_cache.get("utxos", []),
             tx_template.outputs,
@@ -149,7 +320,6 @@ def fund_transaction(
             reserved_outpoints=set(active_reservations) | set(pending_spent),
             max_fee_sats=max_fee_sats,
         )
-        reserved_at = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         for selected in selection["selected"]:
             active_reservations[selected["outpoint"]] = {
                 "draft_id": draft_id,
@@ -173,29 +343,16 @@ def fund_transaction(
         change_entry = None
         if selection["change_sats"]:
             try:
-                change_result = get_new_address(
+                change_entry = _reserve_change_address(
                     wallet_name,
-                    wallet_file=wallet_file,
-                    change=True,
+                    draft_id,
+                    wallet_file,
+                    cache_file,
                     address_type=address_type,
                     network=network,
                 )
             except WalletError as exc:
                 raise TransactionError(str(exc)) from exc
-            address_book = get_wallet_address_book(
-                wallet_name,
-                wallet_file=wallet_file,
-                address_type=address_type,
-                network=network,
-            )
-            matches = [
-                item
-                for item in address_book["addresses"]
-                if item["path"] == change_result["derivation_path"]
-            ]
-            if len(matches) != 1 or matches[0]["branch"] != 1:
-                raise TransactionError("issued change address is not present in wallet")
-            change_entry = matches[0]
             funded_outputs.append(
                 TxOutput(selection["change_sats"], bytes.fromhex(change_entry["script_pubkey"]))
             )
@@ -236,7 +393,10 @@ def fund_transaction(
             "draft_id": draft_id,
             "created_at": utc_now(),
             "utxo_source": utxo_source,
-            "cache_file": str(cache_file),
+            # Persist absolute paths because funded documents can be signed and
+            # broadcast from a different working directory or after a restart.
+            "cache_file": str(cache_file.resolve()),
+            "wallet_file": str(wallet_file.resolve()),
             "unsigned_tx_hex": serialize_transaction_hex(funded_tx, include_witness=False),
             "inputs": input_metadata,
             "outputs": output_metadata,
@@ -298,9 +458,12 @@ def fund_all_transaction(
                 f"wallet cache is stale ({cache_age} seconds old); run syncwallet or increase max cache age"
             )
         active_reservations = _cleanup_reservations(wallet_cache, now)
+        wallet_cache["reserved_outpoints"] = active_reservations
+        _require_no_active_draft(wallet_cache)
         pending_spent = wallet_cache.get("pending_spent_outpoints", {})
         if not isinstance(pending_spent, dict):
             raise TransactionError("wallet pending-spent outpoints are invalid")
+        reserved_at = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         selection = select_all_coins(
             wallet_cache.get("utxos", []),
             destination_script,
@@ -311,7 +474,6 @@ def fund_all_transaction(
             reserved_outpoints=set(active_reservations) | set(pending_spent),
             max_fee_sats=max_fee_sats,
         )
-        reserved_at = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         for selected in selection["selected"]:
             active_reservations[selected["outpoint"]] = {
                 "draft_id": draft_id,
@@ -400,6 +562,7 @@ def _validate_prevouts_against_wallet_and_cache(
         reservations = wallet_cache.get("reserved_outpoints", {})
         if not isinstance(reservations, dict):
             raise TransactionError("wallet UTXO reservations are invalid")
+        reserved_change = _validated_reserved_change(wallet_cache)
     for prevout in prevouts:
         entry = wallet_entries.get(prevout.derivation_path)
         cached = cached_utxos.get(prevout.outpoint)
@@ -426,19 +589,56 @@ def _validate_prevouts_against_wallet_and_cache(
     for output in outputs:
         if not output.get("is_change"):
             continue
-        entry = wallet_entries.get(output.get("derivation_path"))
-        if (
-            not isinstance(entry, dict)
-            or entry.get("branch") != 1
-            or entry.get("address") != output.get("address")
-            or entry.get("script_pubkey") != output.get("script_pubkey")
-            or entry.get("account_id") != output.get("account_id")
-            or str(entry.get("address_type", "")).lower() != input_type
-        ):
+        entry = None
+        if isinstance(reserved_change, dict):
+            index = reserved_change.get("index")
+            if (
+                reserved_change.get("draft_id") != draft_id
+                or isinstance(index, bool)
+                or not isinstance(index, int)
+                or str(reserved_change.get("address_type", "")).lower()
+                != input_type
+            ):
+                raise TransactionError(
+                    "funded transaction change reservation does not match draft"
+                )
+            try:
+                entry = derive_wallet_address_candidate(
+                    wallet_name,
+                    index,
+                    wallet_file=wallet_file,
+                    change=True,
+                    address_type=input_type,
+                    network=network,
+                )
+            except WalletError as exc:
+                raise TransactionError(str(exc)) from exc
+        else:
+            entry = next(
+                (
+                    candidate
+                    for candidate in address_book["addresses"]
+                    if candidate.get("branch") == 1
+                    and candidate.get("address") == output.get("address")
+                ),
+                None,
+            )
+        if not isinstance(entry, dict) or not _change_output_matches(entry, output, input_type):
             raise TransactionError("funded transaction change output does not belong to wallet")
 
 
-def sign_funded_transaction(
+def _change_output_matches(entry: dict, output: dict, address_type: str) -> bool:
+    return (
+        entry.get("branch") == 1
+        and entry.get("address") == output.get("address")
+        and entry.get("script_pubkey") == output.get("script_pubkey")
+        and entry.get("account_id") == output.get("account_id")
+        and entry.get("path") == output.get("derivation_path")
+        and str(entry.get("address_type", "")).lower() == address_type
+    )
+
+
+def _sign_funded_transaction(
     document: dict,
     wallet_name: str,
     password: str | None,
@@ -492,10 +692,6 @@ def sign_funded_transaction(
             raise TransactionError("could not reach requested fee rate after signing")
 
     if effective_max_fee is not None and signing_result["fee_sats"] > effective_max_fee:
-        try:
-            _release_draft(cache_file, wallet_name, document["draft_id"])
-        except (TransactionError, WalletError):
-            pass
         if final_fee_limit_message:
             raise TransactionError(
                 f"final fee {signing_result['fee_sats']} sats exceeds max fee "
@@ -518,6 +714,7 @@ def sign_funded_transaction(
         "network": network,
         "wallet_name": wallet_name,
         "draft_id": document["draft_id"],
+        "wallet_file": document.get("wallet_file"),
         "signed_at": utc_now(),
         "hex": serialize_transaction_hex(tx),
         "complete": True,
@@ -531,13 +728,146 @@ def sign_funded_transaction(
     return signed_document
 
 
+def sign_funded_transaction(
+    document: dict,
+    wallet_name: str,
+    password: str | None,
+    wallet_file: Path,
+    cache_file: Path,
+    network: str,
+    *,
+    max_fee_sats: int | None = None,
+    final_fee_limit_message: bool = False,
+) -> dict:
+    """Sign a draft and issue its RESERVED change address exactly once."""
+
+    change_was_issued = False
+    try:
+        signed = _sign_funded_transaction(
+            document,
+            wallet_name,
+            password,
+            wallet_file,
+            cache_file,
+            network,
+            max_fee_sats=max_fee_sats,
+            final_fee_limit_message=final_fee_limit_message,
+        )
+        change_outputs = [
+            output for output in signed["outputs"] if output.get("is_change")
+        ]
+        if change_outputs:
+            output = change_outputs[0]
+            address_type = signed["inputs"][0]["address_type"]
+            with locked_cache_file(cache_file):
+                cache = load_wallet_cache(cache_file)
+                wallet_cache = cache.get("wallets", {}).get(wallet_name)
+                if not isinstance(wallet_cache, dict):
+                    raise TransactionError("wallet cache is missing after signing")
+                reserved_change = _validated_reserved_change(wallet_cache)
+                if reserved_change is None:
+                    _validate_issued_change_output(
+                        wallet_name,
+                        output,
+                        wallet_file,
+                        address_type=address_type,
+                        network=network,
+                    )
+                else:
+                    index = reserved_change.get("index")
+                    if (
+                        reserved_change.get("draft_id") != signed["draft_id"]
+                        or isinstance(index, bool)
+                        or not isinstance(index, int)
+                        or str(reserved_change.get("address_type", "")).lower()
+                        != address_type
+                    ):
+                        raise TransactionError(
+                            "wallet change-address reservation does not match signed draft"
+                        )
+                    candidate = derive_wallet_address_candidate(
+                        wallet_name,
+                        index,
+                        wallet_file=wallet_file,
+                        change=True,
+                        address_type=address_type,
+                        network=network,
+                    )
+                    if not _change_output_matches(candidate, output, address_type):
+                        raise TransactionError(
+                            "signed change output does not match its reservation"
+                        )
+                    issue_change_address(
+                        wallet_name,
+                        index,
+                        wallet_file=wallet_file,
+                        address_type=address_type,
+                        network=network,
+                    )
+                    change_was_issued = True
+                    wallet_cache.pop("reserved_change", None)
+                    save_wallet_cache(cache, cache_file)
+        return signed
+    except Exception:
+        draft_id = document.get("draft_id") if isinstance(document, dict) else None
+        if isinstance(draft_id, str) and not change_was_issued:
+            try:
+                _release_draft(cache_file, wallet_name, draft_id)
+            except (TransactionError, WalletError):
+                pass
+        raise
+
+
+def _validate_issued_change_output(
+    wallet_name: str,
+    output: dict,
+    wallet_file: Path,
+    *,
+    address_type: str,
+    network: str,
+) -> None:
+    """Require a change output to exist in the already-issued address book."""
+
+    address_book = get_wallet_address_book(
+        wallet_name,
+        wallet_file=wallet_file,
+        address_type=address_type,
+        network=network,
+    )
+    entry = next(
+        (
+            candidate
+            for candidate in address_book["addresses"]
+            if candidate.get("branch") == 1
+            and candidate.get("address") == output.get("address")
+        ),
+        None,
+    )
+    if not isinstance(entry, dict) or not _change_output_matches(
+        entry,
+        output,
+        address_type,
+    ):
+        raise TransactionError("change address has not been issued by this wallet")
+
+
 def record_successful_broadcast(
     signed_document: dict,
     cache_file: Path,
     backend_url: str,
+    wallet_file: Path | None = None,
 ) -> None:
     wallet_name = signed_document.get("wallet_name")
     draft_id = signed_document.get("draft_id")
+    summary = None
+    if wallet_file is not None:
+        address_book = get_wallet_address_book(
+            wallet_name,
+            wallet_file=wallet_file,
+            network=signed_document["network"],
+        )
+        owned = {entry["address"]: entry for entry in address_book["addresses"]}
+        summary = pending_summary_from_signed(signed_document, owned)
     with locked_cache_file(cache_file):
         cache = load_wallet_cache(cache_file)
         wallet_cache = cache.get("wallets", {}).get(wallet_name)
@@ -568,6 +898,9 @@ def record_successful_broadcast(
                 ],
                 "status": "broadcast",
             }
+        if summary is not None:
+            pending_entry["wallet_delta_sats"] = summary["net"]
+            pending_entry["observed_in_sync"] = False
         wallet_cache["pending_transactions"] = [
             item
             for item in pending
@@ -582,6 +915,22 @@ def record_successful_broadcast(
                 "spending_txid": signed_document["txid"],
                 "broadcast_at": pending_entry["broadcast_at"],
             }
+        if summary is not None:
+            transactions = wallet_cache.setdefault("transactions", [])
+            if not isinstance(transactions, list):
+                raise TransactionError("wallet transaction cache is invalid")
+            wallet_cache["transactions"] = [
+                summary,
+                *(
+                    transaction
+                    for transaction in transactions
+                    if not isinstance(transaction, dict)
+                    or transaction.get("txid") != summary["txid"]
+                ),
+            ]
+        wallet_cache.setdefault("balance", {}).update(
+            calculate_wallet_balance(wallet_cache).cache_fields()
+        )
         save_wallet_cache(cache, cache_file)
 
 
@@ -591,6 +940,7 @@ def broadcast_signed_transaction(
     backend,
     *,
     cache_file: Path | None = None,
+    wallet_file: Path | None = None,
     max_fee_sats: int | None = None,
 ) -> dict:
     """Run local preflight checks, broadcast, then persist public pending state."""
@@ -620,6 +970,48 @@ def broadcast_signed_transaction(
 
     if getattr(backend, "network", None) != network:
         raise TransactionError("broadcast backend network does not match transaction network")
+    effective_wallet_file = wallet_file or (
+        Path(document["wallet_file"])
+        if isinstance(document.get("wallet_file"), str)
+        else None
+    )
+    change_outputs = [
+        output for output in document.get("outputs", []) if output.get("is_change")
+    ]
+    if cache_file is not None:
+        with locked_cache_file(cache_file):
+            cache = load_wallet_cache(cache_file)
+            wallet_cache = cache.get("wallets", {}).get(document["wallet_name"])
+            if not isinstance(wallet_cache, dict):
+                raise TransactionError("wallet cache is missing before broadcast")
+            reservations = wallet_cache.get("reserved_outpoints", {})
+            if not isinstance(reservations, dict):
+                raise TransactionError("wallet cache reservations are invalid")
+            for item in document["inputs"]:
+                outpoint = f"{item['txid']}:{item['vout']}"
+                reservation = reservations.get(outpoint)
+                if (
+                    not isinstance(reservation, dict)
+                    or reservation.get("draft_id") != document["draft_id"]
+                ):
+                    raise TransactionError(
+                        f'input "{outpoint}" is not reserved by this signed draft'
+                    )
+    if change_outputs:
+        if effective_wallet_file is None:
+            raise TransactionError(
+                "wallet file is required to validate issued change before broadcast"
+            )
+        try:
+            _validate_issued_change_output(
+                document["wallet_name"],
+                change_outputs[0],
+                effective_wallet_file,
+                address_type=document["inputs"][0]["address_type"],
+                network=network,
+            )
+        except WalletError as exc:
+            raise TransactionError(str(exc)) from exc
     backend.verify_network()
     remote_txid = backend.broadcast_transaction(document["hex"])
     if remote_txid != metrics["txid"]:
@@ -629,7 +1021,12 @@ def broadcast_signed_transaction(
     cache_warning = None
     if cache_file is not None and document.get("wallet_name"):
         try:
-            record_successful_broadcast(document, cache_file, backend.base_url)
+            record_successful_broadcast(
+                document,
+                cache_file,
+                backend.base_url,
+                effective_wallet_file,
+            )
         except (TransactionError, WalletError) as exc:
             cache_warning = str(exc)
     return {

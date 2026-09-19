@@ -94,8 +94,8 @@ def _start_import_scan(
     progress.protocol("WM_DELETE_WINDOW", lambda: None)
     tk.Label(
         progress,
-        text="Scanning 20 receive and 20 change addresses…\n"
-        "Balance and transaction history will update when complete.",
+        text="Discovering receive and change address history…\n"
+        "Each branch stops after 20 consecutive unused addresses.",
         padx=24,
         pady=18,
         justify="center",
@@ -127,20 +127,23 @@ def _start_import_scan(
         progress.grab_release()
         progress.destroy()
         if error is not None:
-            # bitcoin-tool may already have safely stored the encrypted wallet
-            # before a network scan fails. Reflect that state instead of leaving
-            # the UI looking uninitialized.
-            try:
-                state.reload_wallet()
-            except ValueError:
-                pass
             messagebox.showerror("Import Wallet", str(error), parent=parent)
             return
 
         state.apply_wallet_creation(creation)
+        discovery_text = ""
+        if creation.discovery is not None:
+            discovery_text = (
+                "\n\n"
+                f"Receive: scanned {creation.discovery.receive_scanned}, "
+                f"found {creation.discovery.receive_used} used.\n"
+                f"Change: scanned {creation.discovery.change_scanned}, "
+                f"found {creation.discovery.change_used} used."
+            )
         messagebox.showinfo(
             "Import Wallet",
-            f'Wallet "{state.wallet_name.get()}" was imported and synchronized.',
+            f'Wallet "{state.wallet_name.get()}" was imported and synchronized.'
+            f"{discovery_text}",
             parent=parent,
         )
 

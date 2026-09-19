@@ -207,11 +207,22 @@ def _broadcast_withdrawal(
     def failed(error: Exception) -> None:
         retry = messagebox.askretrycancel(
             "Broadcast Failed",
-            f"{error}\n\nThe signed transaction remains reserved. Retry broadcast?",
+            f"{error}\n\nThe signed transaction remains reserved. Retry broadcast?\n\n"
+            "Choosing Cancel abandons this payment and releases its inputs. "
+            "Its already-issued change address will not be reused.",
             parent=parent,
         )
         if retry:
             _broadcast_withdrawal(parent, theme, state, review)
+            return
+        try:
+            state.cancel_withdrawal(review.review_id)
+        except ValueError as cancel_error:
+            messagebox.showerror(
+                "Cannot Release Withdrawal",
+                str(cancel_error),
+                parent=parent,
+            )
 
     _run_with_progress(
         parent,

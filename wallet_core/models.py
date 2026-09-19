@@ -90,10 +90,28 @@ class WalletSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class AddressDiscoverySummary:
+    """UI-facing summary of mnemonic address discovery."""
+
+    receive_scanned: int
+    change_scanned: int
+    receive_used: int
+    change_used: int
+
+
+@dataclass(frozen=True, slots=True)
 class WalletSnapshot:
     name: str
+    # `balance` is the effective amount shown by the UI. The remaining fields
+    # retain the platform's accounting distinctions for future screens and
+    # prevent callers from treating pending funds as immediately spendable.
     balance: BitcoinAmount
     receive_address: str
+    authoritative_balance: BitcoinAmount = BitcoinAmount(0)
+    confirmed_balance: BitcoinAmount = BitcoinAmount(0)
+    unconfirmed_chain_balance: BitcoinAmount = BitcoinAmount(0)
+    pending_delta: BitcoinAmount = BitcoinAmount(0)
+    available_balance: BitcoinAmount = BitcoinAmount(0)
     network: str = "mainnet"
     transactions: tuple[TransactionSummary, ...] = ()
     is_initialized: bool = True
@@ -106,6 +124,7 @@ class WalletCreation:
     snapshot: WalletSnapshot
     mnemonic: str
     imported: bool
+    discovery: AddressDiscoverySummary | None = None
 
 
 @dataclass(frozen=True, slots=True)

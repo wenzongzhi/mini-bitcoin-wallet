@@ -33,6 +33,7 @@ from .wallet_cache import (
     save_wallet_cache,
     utc_now,
 )
+from .transaction_accounting import calculate_wallet_balance, transaction_direction
 
 
 def _stats_value(stats: dict, key: str) -> int:
@@ -152,12 +153,15 @@ def _summarize_transaction(tx: dict, address_map: dict[str, dict], tip_height: i
         return None
     involved_entries = [address_map[address] for address in involved_addresses]
     net = received - sent
-    if sent and received:
-        direction = "self" if net == 0 else ("receive" if net > 0 else "send")
-    elif sent:
-        direction = "send"
-    else:
-        direction = "receive"
+    has_external_output = any(
+        isinstance(output, dict)
+        and isinstance(output.get("value"), int)
+        and not isinstance(output.get("value"), bool)
+        and output["value"] > 0
+        and output.get("scriptpubkey_address") not in address_map
+        for output in tx.get("vout", [])
+    )
+    direction = transaction_direction(sent, received, net, has_external_output)
 
     status = tx.get("status", {})
     if not isinstance(status, dict):
@@ -237,9 +241,22 @@ def sync_wallet(
         address = entry["address"]
         address_data = backend.get_address(address)
         utxos = backend.get_address_utxos(address)
-        transactions = (
-            backend.get_address_transactions(address) if include_transactions else []
-        )
+        if include_transactions:
+            history_reader = getattr(backend, "get_all_address_transactions", None)
+            if history_reader is None:
+                raise WalletError(
+                    "backend cannot guarantee complete wallet transaction history"
+                )
+            try:
+                transactions = history_reader(address)
+            except Exception as exc:
+                if isinstance(exc, WalletError):
+                    raise
+                raise WalletError(
+                    f'cannot retrieve complete transaction history for "{address}": {exc}'
+                ) from exc
+        else:
+            transactions = []
         if _address_is_used(address_data, utxos, transactions):
             used_addresses.add(address)
 
@@ -309,7 +326,7 @@ def sync_wallet(
         "addresses": address_caches,
         "utxos": all_utxos,
         "transactions": transactions,
-        "transactions_complete": False,
+        "transactions_complete": include_transactions,
     }
 
     with locked_cache_file(cache_path):
@@ -317,20 +334,45 @@ def sync_wallet(
         previous = cache.get("wallets", {}).get(wallet_name, {})
         if isinstance(previous, dict):
             reservations = previous.get("reserved_outpoints", {})
+            reserved_change = previous.get("reserved_change")
             pending = previous.get("pending_transactions", [])
             pending_spent = previous.get("pending_spent_outpoints", {})
             if isinstance(reservations, dict):
                 wallet_cache["reserved_outpoints"] = reservations
+            if isinstance(reserved_change, dict):
+                wallet_cache["reserved_change"] = reserved_change
             if isinstance(pending, list):
                 confirmed_txids = {
                     tx["txid"] for tx in transactions if tx.get("confirmed") is True
                 }
-                wallet_cache["pending_transactions"] = [
-                    item
+                remaining_pending = [
+                    dict(item)
                     for item in pending
                     if isinstance(item, dict)
                     and item.get("txid") not in confirmed_txids
                 ]
+                for item in remaining_pending:
+                    item["observed_in_sync"] = item.get("txid") in tx_by_id
+                wallet_cache["pending_transactions"] = remaining_pending
+                current_txids = {
+                    item.get("txid")
+                    for item in wallet_cache["transactions"]
+                    if isinstance(item, dict)
+                }
+                previous_transactions = previous.get("transactions", [])
+                if isinstance(previous_transactions, list):
+                    optimistic_txids = {
+                        item.get("txid")
+                        for item in remaining_pending
+                        if item.get("observed_in_sync") is False
+                    }
+                    wallet_cache["transactions"].extend(
+                        item
+                        for item in previous_transactions
+                        if isinstance(item, dict)
+                        and item.get("txid") in optimistic_txids
+                        and item.get("txid") not in current_txids
+                    )
                 active_pending_txids = {
                     item.get("txid")
                     for item in wallet_cache["pending_transactions"]
@@ -343,6 +385,16 @@ def sync_wallet(
                         if isinstance(item, dict)
                         and item.get("spending_txid") in active_pending_txids
                     }
+        wallet_cache["transactions"].sort(
+            key=lambda tx: (
+                tx.get("status", {}).get("block_height", 2**31),
+                tx.get("txid", ""),
+            ),
+            reverse=True,
+        )
+        wallet_cache["balance"].update(
+            calculate_wallet_balance(wallet_cache).cache_fields()
+        )
         cache["version"] = CACHE_VERSION
         cache.setdefault("wallets", {})[wallet_name] = wallet_cache
         save_wallet_cache(cache, cache_path)
@@ -363,11 +415,12 @@ def get_cached_balance(
     balance = wallet_cache.get("balance")
     if not isinstance(balance, dict):
         raise WalletError("wallet cache balance is invalid")
+    calculated = calculate_wallet_balance(wallet_cache)
     return {
         "wallet_name": wallet_name,
         "synced_at": wallet_cache.get("synced_at"),
         "tip": wallet_cache.get("tip", {}),
-        "balance": balance,
+        "balance": calculated.cache_fields(),
         "cache_file": str(cache_path),
     }
 

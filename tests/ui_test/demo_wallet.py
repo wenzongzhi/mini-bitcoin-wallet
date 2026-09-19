@@ -1,4 +1,4 @@
-"""Deterministic local backend used until the bitcoin-tool adapter is wired."""
+"""Deterministic in-memory wallet backend for tests and manual UI debugging."""
 
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -30,6 +30,11 @@ class DemoWalletService(WalletService):
             name="Bitcoin Wallet",
             balance=BitcoinAmount(408_000),
             receive_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            authoritative_balance=BitcoinAmount(408_000),
+            confirmed_balance=BitcoinAmount(408_000),
+            unconfirmed_chain_balance=BitcoinAmount(0),
+            pending_delta=BitcoinAmount(0),
+            available_balance=BitcoinAmount(408_000),
             transactions=(
                 self._transaction("demo-outgoing", -210_203),
                 self._transaction("demo-incoming-1", 179_475),
@@ -104,6 +109,11 @@ class DemoWalletService(WalletService):
             name="No Wallet",
             balance=BitcoinAmount(0),
             receive_address="",
+            authoritative_balance=BitcoinAmount(0),
+            confirmed_balance=BitcoinAmount(0),
+            unconfirmed_chain_balance=BitcoinAmount(0),
+            pending_delta=BitcoinAmount(0),
+            available_balance=BitcoinAmount(0),
             is_initialized=False,
         )
         return self._snapshot
@@ -127,14 +137,14 @@ class DemoWalletService(WalletService):
             raise ValueError("The destination is not a supported mainnet Bitcoin address.")
         fee = BitcoinAmount(self.ESTIMATED_TRANSACTION_VBYTES * fee_rate_sat_vb)
         if send_all:
-            spendable = self._snapshot.balance.sats - fee.sats
+            spendable = self._snapshot.available_balance.sats - fee.sats
             if spendable <= 0:
                 raise ValueError("The wallet balance is not enough to pay the fee.")
             amount = BitcoinAmount(spendable)
         assert amount is not None
         if amount.sats <= 0:
             raise ValueError("The amount must be greater than zero.")
-        if amount.sats + fee.sats > self._snapshot.balance.sats:
+        if amount.sats + fee.sats > self._snapshot.available_balance.sats:
             raise ValueError("The amount and fee exceed the wallet balance.")
         return SendPreview(destination, amount, fee, fee_rate_sat_vb)
 

@@ -42,9 +42,12 @@ mempool.space URL.
   active wallet for each network is remembered in non-secret `settings.json`.
 - Wallet Settings can display recovery words, rename a wallet, replace its
   password, or remove it after ownership confirmation.
-- Imported wallets scan 20 receive and 20 change addresses. The next unused
-  receive address is displayed after synchronization.
-- Balance and history include both receive and change addresses.
+- Imported wallets discover receive and change history independently until each
+  branch reaches 20 consecutive unused addresses. Only history through the last
+  used index is stored, followed by the next receive address; a normal sync then
+  loads UTXOs, balance, and transactions.
+- Balance and history include both receive and change addresses. Home displays
+  effective balance, while transaction funding uses confirmed, available UTXOs.
 - Transaction rows show block time and open a detail dialog with TXID copy and
   the correct mainnet or Testnet4 mempool.space link.
 - Withdrawals synchronize the active wallet, build and sign an exact transaction
@@ -53,6 +56,10 @@ mempool.space URL.
   broadcast is added to Home immediately as an unconfirmed transaction.
 - Max spends every eligible UTXO from the active wallet in one transaction; a
   cancelled review releases its temporary UTXO reservations.
+- A wallet has at most one active payment draft. Preparing reserves a change
+  candidate without advancing its index; cancel or signing failure releases it.
+  Successful signing permanently issues that change address, even if the signed
+  payment is later abandoned before broadcast.
 - Preset fee rates are 0/1/2/3 sat/vB; Custom selects integer rates from 0 to 20.
   Review requires at least 1 sat/vB because zero-fee transactions are rejected by
   the reused bitcoin-tool workflow and standard relay policy.

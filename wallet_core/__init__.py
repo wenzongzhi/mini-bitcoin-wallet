@@ -7,6 +7,7 @@ service without changing the pages.
 
 from .application import WalletApplication
 from .models import (
+    AddressDiscoverySummary,
     BitcoinAmount,
     BroadcastResult,
     DisplayUnit,
@@ -23,6 +24,7 @@ from .models import (
 from .ports import WalletService
 
 __all__ = [
+    "AddressDiscoverySummary",
     "BitcoinAmount",
     "BroadcastResult",
     "DisplayUnit",

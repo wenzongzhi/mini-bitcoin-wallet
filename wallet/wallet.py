@@ -585,16 +585,346 @@ def _derive_address_entry(
     }
 
 
+def derive_wallet_address_candidate(
+    wallet_name: str,
+    index: int,
+    *,
+    wallet_file: Path | None = None,
+    change: bool = False,
+    address_type: str = DEFAULT_ADDRESS_TYPE,
+    network: str = NETWORK_MAINNET,
+) -> dict:
+    """Derive one wallet address without issuing it or changing an index."""
+
+    _validate_wallet_name(wallet_name)
+    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < 2**31:
+        raise WalletError("address index must be in range 0..2147483647")
+    branch = BTC_CHANGE_BRANCH if change else BTC_RECEIVE_BRANCH
+    path = wallet_file or default_wallet_file(network=network)
+    with _locked_wallet_file(path):
+        wallets = _load_wallets(path)
+        wallet = wallets.get(wallet_name)
+        if not isinstance(wallet, dict):
+            raise WalletError(f'wallet "{wallet_name}" does not exist in "{path}"')
+        normalized_type, definition, account = _get_account(
+            wallet,
+            address_type,
+            network,
+        )
+        account_xpub, account_path, _ = _read_account_state(
+            account,
+            definition,
+            branch,
+            network,
+        )
+        entry = _derive_address_entry(
+            account_xpub,
+            account_path,
+            normalized_type,
+            branch,
+            index,
+            created_at=None,
+            network=network,
+        )
+    return {
+        **entry,
+        "wallet_name": wallet_name,
+        "network": network,
+        "account_id": definition["account_id"],
+        "address_type": definition["address_type"],
+    }
+
+
+def derive_next_change_address_candidate(
+    wallet_name: str,
+    *,
+    wallet_file: Path | None = None,
+    address_type: str = DEFAULT_ADDRESS_TYPE,
+    network: str = NETWORK_MAINNET,
+) -> dict:
+    """Derive the current change index without issuing or advancing it."""
+
+    _validate_wallet_name(wallet_name)
+    path = wallet_file or default_wallet_file(network=network)
+    with _locked_wallet_file(path):
+        wallets = _load_wallets(path)
+        wallet = wallets.get(wallet_name)
+        if not isinstance(wallet, dict):
+            raise WalletError(f'wallet "{wallet_name}" does not exist in "{path}"')
+        normalized_type, definition, account = _get_account(
+            wallet,
+            address_type,
+            network,
+        )
+        account_xpub, account_path, index = _read_account_state(
+            account,
+            definition,
+            BTC_CHANGE_BRANCH,
+            network,
+        )
+        entry = _derive_address_entry(
+            account_xpub,
+            account_path,
+            normalized_type,
+            BTC_CHANGE_BRANCH,
+            index,
+            created_at=None,
+            network=network,
+        )
+    return {
+        **entry,
+        "wallet_name": wallet_name,
+        "network": network,
+        "account_id": definition["account_id"],
+        "address_type": definition["address_type"],
+    }
+
+
+def issue_change_address(
+    wallet_name: str,
+    index: int,
+    *,
+    wallet_file: Path | None = None,
+    address_type: str = DEFAULT_ADDRESS_TYPE,
+    network: str = NETWORK_MAINNET,
+) -> dict:
+    """Issue exactly the reserved change index; repeated calls are idempotent."""
+
+    _validate_wallet_name(wallet_name)
+    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < 2**31:
+        raise WalletError("address index must be in range 0..2147483647")
+    path = wallet_file or default_wallet_file(network=network)
+    with _locked_wallet_file(path):
+        wallets = _load_wallets(path)
+        wallet = wallets.get(wallet_name)
+        if not isinstance(wallet, dict):
+            raise WalletError(f'wallet "{wallet_name}" does not exist in "{path}"')
+        normalized_type, definition, account = _get_account(
+            wallet,
+            address_type,
+            network,
+        )
+        account_xpub, account_path, next_index = _read_account_state(
+            account,
+            definition,
+            BTC_CHANGE_BRANCH,
+            network,
+        )
+        expected = _derive_address_entry(
+            account_xpub,
+            account_path,
+            normalized_type,
+            BTC_CHANGE_BRANCH,
+            index,
+            created_at=None,
+            network=network,
+        )
+        issued = account.get("issued_addresses")
+        if not isinstance(issued, list):
+            raise WalletError("wallet address book is invalid")
+        existing = next(
+            (
+                entry
+                for entry in issued
+                if isinstance(entry, dict)
+                and entry.get("branch") == BTC_CHANGE_BRANCH
+                and entry.get("index") == index
+            ),
+            None,
+        )
+        if index < next_index:
+            if not isinstance(existing, dict):
+                raise WalletError("issued change address is missing from address book")
+            for field in ("address", "script_pubkey", "path", "relative_path"):
+                if existing.get(field) != expected[field]:
+                    raise WalletError("issued change address does not match account xpub")
+            entry = existing
+        elif index == next_index:
+            if existing is None:
+                entry = expected
+                entry["created_at"] = _utc_now()
+                issued.append(entry)
+            else:
+                for field in ("address", "script_pubkey", "path", "relative_path"):
+                    if existing.get(field) != expected[field]:
+                        raise WalletError("reserved change address does not match account xpub")
+                existing["created_at"] = existing.get("created_at") or _utc_now()
+                entry = existing
+            account["next_change_index"] = index + 1
+            _save_wallets(wallets, path)
+        else:
+            raise WalletError("reserved change index does not match next_change_index")
+    return _address_result(wallet_name, network, definition, entry)
+
+
+def commit_discovered_addresses(
+    wallet_name: str,
+    receive_usage: dict[int, bool],
+    change_usage: dict[int, bool],
+    *,
+    wallet_file: Path | None = None,
+    address_type: str = DEFAULT_ADDRESS_TYPE,
+    network: str = NETWORK_MAINNET,
+) -> dict:
+    """Atomically store discovered history and issue the next receive address."""
+
+    _validate_wallet_name(wallet_name)
+    path = wallet_file or default_wallet_file(network=network)
+    with _locked_wallet_file(path):
+        wallets = _load_wallets(path)
+        wallet = wallets.get(wallet_name)
+        if not isinstance(wallet, dict):
+            raise WalletError(f'wallet "{wallet_name}" does not exist in "{path}"')
+        normalized_type, definition, account = _get_account(
+            wallet,
+            address_type,
+            network,
+        )
+        account_xpub, account_path, _ = _read_account_state(
+            account,
+            definition,
+            BTC_RECEIVE_BRANCH,
+            network,
+        )
+        if (
+            account.get("next_receive_index") != 0
+            or account.get("next_change_index") != 0
+            or account.get("issued_addresses") != []
+        ):
+            raise WalletError("wallet discovery requires an empty address book")
+        entries = []
+        for branch, usage in (
+            (BTC_RECEIVE_BRANCH, receive_usage),
+            (BTC_CHANGE_BRANCH, change_usage),
+        ):
+            if not isinstance(usage, dict) or any(
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index < 0
+                for index in usage
+            ):
+                raise WalletError("wallet discovery result is invalid")
+            expected_indexes = list(range(max(usage, default=-1) + 1))
+            if sorted(usage) != expected_indexes or any(
+                not isinstance(value, bool) for value in usage.values()
+            ):
+                raise WalletError("wallet discovery result is invalid")
+            for index in expected_indexes:
+                entry = _derive_address_entry(
+                    account_xpub,
+                    account_path,
+                    normalized_type,
+                    branch,
+                    index,
+                    created_at=None,
+                    network=network,
+                )
+                entry["used"] = usage[index]
+                entries.append(entry)
+
+        next_receive = max(receive_usage, default=-1) + 1
+        receive_entry = _derive_address_entry(
+            account_xpub,
+            account_path,
+            normalized_type,
+            BTC_RECEIVE_BRANCH,
+            next_receive,
+            created_at=_utc_now(),
+            network=network,
+        )
+        entries.append(receive_entry)
+        account["issued_addresses"] = entries
+        account["next_receive_index"] = next_receive + 1
+        account["next_change_index"] = max(change_usage, default=-1) + 1
+        _save_wallets(wallets, path)
+    return _address_result(wallet_name, network, definition, receive_entry)
+
+
+def _address_result(
+    wallet_name: str,
+    network: str,
+    definition: dict,
+    entry: dict,
+) -> dict:
+    return {
+        "wallet_name": wallet_name,
+        "network": network,
+        "account_id": definition["account_id"],
+        "address": entry["address"],
+        "address_type": definition["address_type"],
+        "purpose": entry["purpose"],
+        "branch": entry["branch"],
+        "index": entry["index"],
+        "relative_derivation_path": entry["relative_path"],
+        "derivation_path": entry["path"],
+        "script_pubkey": entry["script_pubkey"],
+    }
+
+
 def get_new_address(
     wallet_name: str,
     wallet_file: Path | None = None,
     change: bool = False,
     address_type: str = DEFAULT_ADDRESS_TYPE,
     network: str = NETWORK_MAINNET,
+    cache_file: Path | None = None,
 ) -> dict:
+    """Issue the next receive or change address.
+
+    A change address cannot be issued manually while the cache says that the
+    current index belongs to a payment draft.  Both the manual and payment
+    paths acquire the cache lock before the wallet lock, which makes the check
+    and index advance atomic with respect to one another.
+    """
+
     _validate_wallet_name(wallet_name)
     branch = BTC_CHANGE_BRANCH if change else BTC_RECEIVE_BRANCH
     path = wallet_file or default_wallet_file(network=network)
+    if not change:
+        return _issue_next_address(
+            wallet_name,
+            path,
+            branch,
+            address_type,
+            network,
+        )
+
+    from .wallet_cache import (
+        default_wallet_cache_file,
+        load_wallet_cache,
+        locked_cache_file,
+    )
+
+    selected_cache = cache_file or default_wallet_cache_file(path.parent, network)
+    with locked_cache_file(selected_cache):
+        cache = load_wallet_cache(selected_cache)
+        wallet_cache = cache.get("wallets", {}).get(wallet_name, {})
+        if isinstance(wallet_cache, dict):
+            reserved_change = wallet_cache.get("reserved_change")
+            if reserved_change is not None:
+                if not isinstance(reserved_change, dict):
+                    raise WalletError("wallet change-address reservation is invalid")
+                raise WalletError(
+                    "wallet change address is reserved by an active payment draft"
+                )
+        return _issue_next_address(
+            wallet_name,
+            path,
+            branch,
+            address_type,
+            network,
+        )
+
+
+def _issue_next_address(
+    wallet_name: str,
+    path: Path,
+    branch: int,
+    address_type: str,
+    network: str,
+) -> dict:
+    """Issue one address while the caller owns any required cache lock."""
+
     with _locked_wallet_file(path):
         wallets = _load_wallets(path)
         wallet = wallets.get(wallet_name)
@@ -615,39 +945,48 @@ def get_new_address(
         issued_addresses = account.get("issued_addresses")
         if not isinstance(issued_addresses, list):
             raise WalletError("wallet address book is invalid")
-        if any(
-            isinstance(entry, dict)
-            and _entry_branch(entry) == branch
-            and entry.get("index") == index
-            for entry in issued_addresses
-        ):
-            raise WalletError("wallet address index is already present in the address book")
-
-        entry = _derive_address_entry(
-            account_xpub,
-            account_path,
-            normalized_type,
-            branch,
-            index,
-            created_at=_utc_now(),
-            network=network,
+        existing_entry = next(
+            (
+                entry
+                for entry in issued_addresses
+                if isinstance(entry, dict)
+                and _entry_branch(entry) == branch
+                and entry.get("index") == index
+            ),
+            None,
         )
-        issued_addresses.append(entry)
+        if existing_entry is not None and existing_entry.get("created_at") is not None:
+            raise WalletError("wallet address index is already present in the address book")
+        if existing_entry is None:
+            entry = _derive_address_entry(
+                account_xpub,
+                account_path,
+                normalized_type,
+                branch,
+                index,
+                created_at=_utc_now(),
+                network=network,
+            )
+            issued_addresses.append(entry)
+        else:
+            expected = _derive_address_entry(
+                account_xpub,
+                account_path,
+                normalized_type,
+                branch,
+                index,
+                created_at=None,
+                network=network,
+            )
+            for field in ("address", "script_pubkey", "path", "relative_path"):
+                if existing_entry.get(field) != expected[field]:
+                    raise WalletError("wallet discovery address does not match account xpub")
+            existing_entry["created_at"] = _utc_now()
+            entry = existing_entry
         account[_next_index_key(branch)] = index + 1
         _save_wallets(wallets, path)
 
-    return {
-        "wallet_name": wallet_name,
-        "network": network,
-        "account_id": definition["account_id"],
-        "address": entry["address"],
-        "address_type": definition["address_type"],
-        "purpose": entry["purpose"],
-        "branch": branch,
-        "index": entry["index"],
-        "relative_derivation_path": entry["relative_path"],
-        "derivation_path": entry["path"],
-    }
+    return _address_result(wallet_name, network, definition, entry)
 
 
 def derive_p2wpkh_public_key_from_account_xpub(

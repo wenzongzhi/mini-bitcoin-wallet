@@ -3,10 +3,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
-from adapters import BitcoinToolWalletService, DemoWalletService
+from adapters import BitcoinToolWalletService
 from app_settings import ApplicationSettingsStore
 from btc.chainparams import NETWORK_TESTNET4
 from explorer_links import transaction_explorer_url
+from tests.ui_test.demo_wallet import DemoWalletService
 from tx.codec import deserialize_transaction_hex, transaction_txid
 from wallet_core import BitcoinAmount, DisplayUnit, WalletApplication
 from wallet import get_new_address, get_wallet_address_book
@@ -51,7 +52,7 @@ class FakeEsploraBackend:
                 "spent_txo_count": 0,
                 "spent_txo_sum": 0,
             },
-            "mempool_stats": {},
+            "mempool_stats": {"tx_count": 0},
         }
 
     def get_address_utxos(self, address):
@@ -87,6 +88,11 @@ class FakeEsploraBackend:
                 },
             }
         ]
+
+    def get_all_address_transactions(self, address):
+        """The fake dataset is complete, so its one page is the full history."""
+
+        return self.get_address_transactions(address)
 
     def broadcast_transaction(self, raw_tx_hex):
         """Accept a valid transaction and return its locally computed TXID."""
@@ -215,6 +221,25 @@ class BitcoinToolWalletServiceTests(TestCase):
         self.assertTrue(all(mnemonic not in settings_text for mnemonic in mnemonics))
         self.assertNotIn('"encryption"', settings_text)
 
+    def test_duplicate_import_name_never_removes_the_existing_wallet(self):
+        existing = self.service.create_wallet("Existing", "original-password")
+
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            self.service.create_wallet(
+                "Existing",
+                "different-password",
+                existing.mnemonic,
+            )
+
+        self.assertEqual(
+            [wallet.name for wallet in self.service.list_wallets()],
+            ["Existing"],
+        )
+        self.assertEqual(
+            self.service.get_mnemonic("original-password"),
+            existing.mnemonic,
+        )
+
     def test_switching_wallets_changes_the_active_snapshot(self):
         self.service.create_wallet("Wallet_A", "password-a")
         self.service.create_wallet("Wallet_B", "password-b")
@@ -308,14 +333,15 @@ class BitcoinToolWalletServiceTests(TestCase):
 
     def test_import_scans_receive_and_change_and_selects_next_unused(self):
         data_directory = Path(self.temporary_directory.name)
+        discovery_backend = FakeEsploraBackend(
+            funded_ordinals={3: 1_000, 26: 2_000}
+        )
         discovered_service = BitcoinToolWalletService(
             data_directory / "discovered-wallets.json",
             data_directory / "discovered-cache.json",
-            backend_factory=lambda network: FakeEsploraBackend(
-                network,
-                # Ordinal 3 is receive index 3; ordinal 22 is change index 2.
-                funded_ordinals={3: 1_000, 22: 2_000},
-            ),
+            # Reuse one ordinal-based fake so an address keeps the same
+            # identity between lightweight discovery and the following sync.
+            backend_factory=lambda _network: discovery_backend,
         )
         words = self.service.create_wallet("seed", "seed-password").mnemonic
         imported = discovered_service.create_wallet(
@@ -332,8 +358,15 @@ class BitcoinToolWalletServiceTests(TestCase):
             if entry["branch"] == 0 and entry["index"] == 4
         )
 
-        self.assertEqual(address_book["address_count"], 40)
+        # Persist only receive 0..3 plus the next receive address, and change
+        # history 0..2. The trailing discovery gap is never written.
+        self.assertEqual(address_book["address_count"], 8)
         self.assertEqual(imported.snapshot.receive_address, receive_index_four)
+        self.assertIsNotNone(imported.discovery)
+        self.assertEqual(imported.discovery.receive_scanned, 24)
+        self.assertEqual(imported.discovery.change_scanned, 23)
+        self.assertEqual(imported.discovery.receive_used, 1)
+        self.assertEqual(imported.discovery.change_used, 1)
         self.assertEqual(imported.snapshot.balance.sats, 3_000)
         self.assertEqual(len(imported.snapshot.transactions), 2)
         first_transaction = imported.snapshot.transactions[0]
@@ -365,18 +398,23 @@ class BitcoinToolWalletServiceTests(TestCase):
 
     def test_testnet4_import_uses_the_same_discovery_flow(self):
         data_directory = Path(self.temporary_directory.name)
+        discovery_backend = FakeEsploraBackend(
+            NETWORK_TESTNET4,
+            funded_ordinals={1: 4_000, 23: 5_000},
+        )
         testnet_service = BitcoinToolWalletService(
             data_directory / "restored_testnet4.json",
             data_directory / "restored_testnet4_cache.json",
             network=NETWORK_TESTNET4,
-            backend_factory=lambda network: FakeEsploraBackend(
-                network, funded_ordinals={1: 4_000, 20: 5_000}
-            ),
+            backend_factory=lambda _network: discovery_backend,
         )
         words = self.service.create_wallet("seed2", "seed-password").mnemonic
         restored = testnet_service.create_wallet("testnet_restore", "password", words)
 
         self.assertTrue(restored.snapshot.receive_address.startswith("tb1q"))
+        self.assertIsNotNone(restored.discovery)
+        self.assertEqual(restored.discovery.receive_scanned, 22)
+        self.assertEqual(restored.discovery.change_scanned, 22)
         self.assertEqual(restored.snapshot.balance.sats, 9_000)
         self.assertEqual(len(restored.snapshot.transactions), 2)
         self.assertTrue(
@@ -426,7 +464,15 @@ class BitcoinToolWalletServiceTests(TestCase):
         snapshot = service.snapshot()
         self.assertEqual(snapshot.pending_txids, (review.txid,))
         self.assertEqual(snapshot.transactions[0].txid, review.txid)
+        self.assertEqual(
+            sum(item.txid == review.txid for item in snapshot.transactions),
+            1,
+        )
         self.assertFalse(snapshot.transactions[0].confirmed)
+        self.assertEqual(snapshot.authoritative_balance.sats, 100_000)
+        self.assertEqual(snapshot.pending_delta.sats, -review.fee.sats)
+        self.assertEqual(snapshot.balance.sats, 100_000 - review.fee.sats)
+        self.assertEqual(snapshot.available_balance.sats, 0)
 
     def test_withdrawal_utxo_sync_preserves_cached_transaction_history(self):
         backend = FakeEsploraBackend(funded_ordinals={0: 100_000})
@@ -466,6 +512,11 @@ class BitcoinToolWalletServiceTests(TestCase):
         status = service.transaction_status("ab" * 32)
 
         self.assertEqual(snapshot.balance.sats, 12_345)
+        self.assertEqual(snapshot.authoritative_balance.sats, 12_345)
+        self.assertEqual(snapshot.confirmed_balance.sats, 12_345)
+        self.assertEqual(snapshot.unconfirmed_chain_balance.sats, 0)
+        self.assertEqual(snapshot.pending_delta.sats, 0)
+        self.assertEqual(snapshot.available_balance.sats, 12_345)
         self.assertIsNotNone(snapshot.synced_at)
         self.assertEqual(backend.transaction_query_count, 1)
         self.assertTrue(status.confirmed)
@@ -523,6 +574,146 @@ class BitcoinToolWalletServiceTests(TestCase):
             cache["wallets"]["MaxWallet"].get("reserved_outpoints", {}),
             {},
         )
+
+    def test_change_reservation_survives_sync_and_cancel_reuses_index(self):
+        cache_file = self.wallet_file.parent / "reservation-cache.json"
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            cache_file,
+            backend_factory=lambda network: FakeEsploraBackend(
+                network, funded_ordinals={0: 100_000}
+            ),
+        )
+        service.create_wallet("ReservationWallet", "password")
+        destination = get_new_address(
+            "ReservationWallet", wallet_file=self.wallet_file, network="mainnet"
+        )["address"]
+
+        first = service.prepare_withdrawal(
+            destination,
+            BitcoinAmount(25_000),
+            2,
+        )
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        wallet_cache = cache["wallets"]["ReservationWallet"]
+        self.assertEqual(wallet_cache["reserved_change"]["index"], 0)
+        self.assertEqual(
+            wallet_cache["reserved_change"]["draft_id"],
+            first.draft_id,
+        )
+        stored = json.loads(self.wallet_file.read_text(encoding="utf-8"))[
+            "ReservationWallet"
+        ]
+        self.assertEqual(
+            stored["accounts"]["bip84-account-0"]["next_change_index"],
+            0,
+        )
+
+        service.synchronize_wallet("ReservationWallet")
+        synchronized_cache = json.loads(cache_file.read_text(encoding="utf-8"))[
+            "wallets"
+        ]["ReservationWallet"]
+        self.assertEqual(
+            synchronized_cache["reserved_change"]["draft_id"],
+            first.draft_id,
+        )
+        with self.assertRaisesRegex(ValueError, "active payment draft"):
+            service.prepare_withdrawal(
+                destination,
+                BitcoinAmount(20_000),
+                2,
+            )
+
+        service.cancel_withdrawal(first.draft_id)
+        replacement = service.prepare_withdrawal(
+            destination,
+            BitcoinAmount(20_000),
+            2,
+        )
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            cache["wallets"]["ReservationWallet"]["reserved_change"]["index"],
+            0,
+        )
+        service.cancel_withdrawal(replacement.draft_id)
+
+    def test_sign_issues_change_and_cancel_never_reclaims_it(self):
+        cache_file = self.wallet_file.parent / "issued-change-cache.json"
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            cache_file,
+            backend_factory=lambda network: FakeEsploraBackend(
+                network, funded_ordinals={0: 100_000}
+            ),
+        )
+        service.create_wallet("IssuedChangeWallet", "password")
+        destination = get_new_address(
+            "IssuedChangeWallet", wallet_file=self.wallet_file, network="mainnet"
+        )["address"]
+        draft = service.prepare_withdrawal(
+            destination,
+            BitcoinAmount(25_000),
+            2,
+        )
+        review = service.sign_withdrawal(draft.draft_id, "password")
+
+        stored = json.loads(self.wallet_file.read_text(encoding="utf-8"))[
+            "IssuedChangeWallet"
+        ]
+        account = stored["accounts"]["bip84-account-0"]
+        self.assertEqual(account["next_change_index"], 1)
+        issued = next(
+            entry
+            for entry in account["issued_addresses"]
+            if entry["branch"] == 1 and entry["index"] == 0
+        )
+        self.assertNotIn("lifecycle_state", issued)
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))["wallets"][
+            "IssuedChangeWallet"
+        ]
+        self.assertNotIn("reserved_change", cache)
+        self.assertTrue(cache["reserved_outpoints"])
+
+        service.cancel_withdrawal(review.review_id)
+        replacement = service.prepare_withdrawal(
+            destination,
+            BitcoinAmount(20_000),
+            2,
+        )
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))["wallets"][
+            "IssuedChangeWallet"
+        ]
+        self.assertEqual(cache["reserved_change"]["index"], 1)
+        service.cancel_withdrawal(replacement.draft_id)
+
+    def test_failed_import_is_rolled_back_and_can_be_retried(self):
+        class OfflineDiscoveryBackend(FakeEsploraBackend):
+            def get_address(self, address):
+                raise OSError("backend offline")
+
+        words = self.service.create_wallet("Seed", "seed-password").mnemonic
+        data_directory = self.wallet_file.parent
+        imported_service = BitcoinToolWalletService(
+            data_directory / "retry-wallets.json",
+            data_directory / "retry-cache.json",
+            backend_factory=lambda network: OfflineDiscoveryBackend(network),
+        )
+
+        with self.assertRaisesRegex(ValueError, "was not saved"):
+            imported_service.create_wallet(
+                "RetryWallet",
+                "password",
+                words,
+            )
+        self.assertEqual(imported_service.list_wallets(), ())
+
+        retry_service = BitcoinToolWalletService(
+            data_directory / "retry-wallets.json",
+            data_directory / "retry-cache.json",
+            backend_factory=lambda network: FakeEsploraBackend(network),
+        )
+        retried = retry_service.create_wallet("RetryWallet", "password", words)
+        self.assertTrue(retried.imported)
 
     def test_testnet4_withdrawal_uses_isolated_wallet_and_explorer(self):
         data_directory = self.wallet_file.parent

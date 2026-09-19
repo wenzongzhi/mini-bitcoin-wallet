@@ -26,6 +26,28 @@ class AccountedTransaction:
     address_types: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class WalletBalance:
+    """Authoritative, optimistic, effective, and spendable wallet amounts."""
+
+    confirmed_sats: int
+    unconfirmed_chain_sats: int
+    authoritative_sats: int
+    pending_delta_sats: int
+    effective_sats: int
+    available_sats: int
+
+    def cache_fields(self) -> dict[str, int]:
+        return {
+            "confirmed": self.confirmed_sats,
+            "unconfirmed": self.unconfirmed_chain_sats,
+            "total": self.authoritative_sats,
+            "pending_delta": self.pending_delta_sats,
+            "effective": self.effective_sats,
+            "available": self.available_sats,
+        }
+
+
 def transaction_from_cache(value: dict) -> AccountedTransaction | None:
     """Validate and normalize one transaction from the public wallet cache."""
 
@@ -77,10 +99,14 @@ def pending_summary_from_signed(
     ]
     received = sum(item["value"] for item in owned_outputs)
     net = received - sent
-    if sent and received:
-        direction = "self" if net == 0 else ("receive" if net > 0 else "send")
-    else:
-        direction = "send" if sent else "receive"
+    has_external_output = any(
+        isinstance(item.get("value"), int)
+        and not isinstance(item.get("value"), bool)
+        and item["value"] > 0
+        and item.get("address") not in owned_address_entries
+        for item in outputs
+    )
+    direction = transaction_direction(sent, received, net, has_external_output)
 
     involved_addresses = {
         item["address"] for item in inputs if item.get("address")
@@ -133,7 +159,121 @@ def upsert_cached_transaction(
                 or transaction.get("txid") != summary["txid"]
             ),
         ]
+        pending = wallet_cache.get("pending_transactions", [])
+        if isinstance(pending, list):
+            for item in pending:
+                if isinstance(item, dict) and item.get("txid") == summary["txid"]:
+                    item["wallet_delta_sats"] = summary["net"]
+                    item["observed_in_sync"] = False
+        wallet_cache.setdefault("balance", {}).update(
+            calculate_wallet_balance(wallet_cache).cache_fields()
+        )
         save_wallet_cache(cache, cache_file)
+
+
+def calculate_wallet_balance(
+    wallet_cache: dict,
+    *,
+    now: datetime | None = None,
+    reservation_ttl_seconds: int | None = None,
+) -> WalletBalance:
+    """Calculate balances while every active draft keeps its inputs unavailable.
+
+    The optional timing arguments remain for source compatibility but no
+    longer expire reservations. Draft state changes require an explicit
+    cancel/failure transition or successful broadcast.
+    """
+
+    del now, reservation_ttl_seconds
+
+    chain_balance = wallet_cache.get("balance", {})
+    if not isinstance(chain_balance, dict):
+        chain_balance = {}
+    if "confirmed" in chain_balance and "unconfirmed" in chain_balance:
+        confirmed = _non_negative_integer(chain_balance.get("confirmed"))
+        unconfirmed = _non_negative_integer(chain_balance.get("unconfirmed"))
+    else:
+        confirmed, unconfirmed = _chain_balance_from_utxos(wallet_cache)
+    authoritative = confirmed + unconfirmed
+
+    pending_delta = 0
+    pending = wallet_cache.get("pending_transactions", [])
+    if isinstance(pending, list):
+        for item in pending:
+            if not isinstance(item, dict) or item.get("observed_in_sync") is True:
+                continue
+            delta = item.get("wallet_delta_sats")
+            if isinstance(delta, int) and not isinstance(delta, bool):
+                pending_delta += delta
+
+    blocked_outpoints = set()
+    pending_spent = wallet_cache.get("pending_spent_outpoints", {})
+    if isinstance(pending_spent, dict):
+        blocked_outpoints.update(pending_spent)
+    reservations = wallet_cache.get("reserved_outpoints", {})
+    if isinstance(reservations, dict):
+        blocked_outpoints.update(
+            outpoint
+            for outpoint, reservation in reservations.items()
+            if isinstance(reservation, dict)
+        )
+    available = 0
+    utxos = wallet_cache.get("utxos", [])
+    if isinstance(utxos, list):
+        for utxo in utxos:
+            if not isinstance(utxo, dict) or utxo.get("confirmed") is not True:
+                continue
+            outpoint = f"{utxo.get('txid')}:{utxo.get('vout')}"
+            value = utxo.get("value")
+            if (
+                outpoint not in blocked_outpoints
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+            ):
+                available += value
+    return WalletBalance(
+        confirmed,
+        unconfirmed,
+        authoritative,
+        pending_delta,
+        authoritative + pending_delta,
+        available,
+    )
+
+
+def transaction_direction(
+    sent_sats: int,
+    received_sats: int,
+    net_sats: int,
+    has_external_output: bool,
+) -> str:
+    """Classify confirmed and optimistic summaries with identical semantics."""
+
+    if sent_sats and received_sats:
+        if not has_external_output:
+            return "self"
+        return "receive" if net_sats > 0 else "send"
+    return "send" if sent_sats else "receive"
+
+
+def _chain_balance_from_utxos(wallet_cache: dict) -> tuple[int, int]:
+    confirmed = 0
+    unconfirmed = 0
+    utxos = wallet_cache.get("utxos", [])
+    if not isinstance(utxos, list):
+        return 0, 0
+    for utxo in utxos:
+        if not isinstance(utxo, dict):
+            continue
+        value = utxo.get("value")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            continue
+        if utxo.get("confirmed") is True:
+            confirmed += value
+        else:
+            unconfirmed += value
+    return confirmed, unconfirmed
 
 
 def _non_negative_integer(value) -> int:

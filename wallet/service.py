@@ -19,8 +19,14 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from btc.chainparams import NETWORK_MAINNET, get_chain_params
 from network import EsploraBackend, EsploraError
 
-from .transaction_accounting import AccountedTransaction, transaction_from_cache
+from .transaction_accounting import (
+    AccountedTransaction,
+    calculate_wallet_balance,
+    transaction_from_cache,
+)
 from .wallet import (
+    BTC_CHANGE_BRANCH,
+    BTC_RECEIVE_BRANCH,
     DEFAULT_ADDRESS_TYPE,
     PBKDF2_ITERATIONS,
     WalletError,
@@ -33,6 +39,8 @@ from .wallet import (
     _validate_mnemonic,
     _validate_wallet_name,
     create_wallet as create_wallet_record,
+    commit_discovered_addresses,
+    derive_wallet_address_candidate,
     get_mnemonic as read_wallet_mnemonic,
     get_new_address,
     get_wallet_address_book,
@@ -47,6 +55,23 @@ from .wallet_cache import (
 from .wallet_sync import sync_wallet as synchronize_wallet_record
 
 
+GAP_LIMIT = 20
+DEFAULT_DISCOVERY_MAX_ADDRESSES = 10_000
+
+
+@dataclass(frozen=True, slots=True)
+class BranchDiscovery:
+    branch: int
+    scanned_count: int
+    used_indexes: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WalletDiscovery:
+    receive: BranchDiscovery
+    change: BranchDiscovery
+
+
 @dataclass(frozen=True, slots=True)
 class WalletMetadata:
     name: str
@@ -58,11 +83,22 @@ class WalletMetadata:
 @dataclass(frozen=True, slots=True)
 class WalletState:
     metadata: WalletMetadata
-    balance_sats: int
+    authoritative_balance_sats: int
+    confirmed_balance_sats: int
+    unconfirmed_chain_balance_sats: int
+    pending_delta_sats: int
+    effective_balance_sats: int
+    available_balance_sats: int
     receive_address: str
     transactions: tuple[AccountedTransaction, ...]
     synced_at: datetime | None
     pending_txids: tuple[str, ...]
+
+    @property
+    def balance_sats(self) -> int:
+        """Compatibility alias for clients that previously displayed total."""
+
+        return self.effective_balance_sats
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +106,7 @@ class WalletCreationResult:
     state: WalletState
     mnemonic: str
     imported: bool
+    discovery: WalletDiscovery | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,16 +128,31 @@ class WalletService:
         backend_factory: Callable[[str], EsploraBackend] | None = None,
         *,
         address_type: str = DEFAULT_ADDRESS_TYPE,
-        import_scan_size: int = 20,
+        gap_limit: int = GAP_LIMIT,
+        discovery_max_addresses: int = DEFAULT_DISCOVERY_MAX_ADDRESSES,
+        import_scan_size: int | None = None,
     ) -> None:
         get_chain_params(network)
-        if import_scan_size <= 0:
-            raise WalletError("import scan size must be positive")
+        if import_scan_size is not None:
+            gap_limit = import_scan_size
+        if isinstance(gap_limit, bool) or not isinstance(gap_limit, int) or gap_limit <= 0:
+            raise WalletError("wallet discovery gap limit must be positive")
+        if (
+            isinstance(discovery_max_addresses, bool)
+            or not isinstance(discovery_max_addresses, int)
+            or discovery_max_addresses < gap_limit
+        ):
+            raise WalletError(
+                "wallet discovery safety limit must be an integer greater than "
+                "or equal to the gap limit"
+            )
         self.wallet_file = Path(wallet_file)
         self.cache_file = Path(cache_file)
         self.network = network
         self.address_type = address_type
-        self.import_scan_size = import_scan_size
+        self.gap_limit = gap_limit
+        self.import_scan_size = gap_limit
+        self.discovery_max_addresses = discovery_max_addresses
         self.backend_factory = backend_factory or (
             lambda selected_network: EsploraBackend(network=selected_network)
         )
@@ -164,6 +216,7 @@ class WalletService:
         imported: bool,
     ) -> WalletCreationResult:
         with self.operation_lock:
+            discovery = None
             create_wallet_record(
                 name,
                 password=password,
@@ -172,7 +225,7 @@ class WalletService:
                 network=self.network,
             )
             if imported:
-                self._ensure_import_scan_pool(name)
+                discovery = self._discover_imported_wallet(name)
                 state = self.sync_wallet(name)
             else:
                 get_new_address(
@@ -182,7 +235,77 @@ class WalletService:
                     network=self.network,
                 )
                 state = self.get_wallet_state(name)
-            return WalletCreationResult(state, mnemonic, imported)
+            return WalletCreationResult(state, mnemonic, imported, discovery)
+
+    def _discover_imported_wallet(self, name: str) -> WalletDiscovery:
+        """Discover address history cheaply, then persist both branches once."""
+
+        backend = self.backend_factory(self.network)
+        if getattr(backend, "network", None) != self.network:
+            raise WalletError("wallet discovery backend network does not match wallet")
+        receive, receive_usage = self._discover_branch(
+            name,
+            BTC_RECEIVE_BRANCH,
+            backend,
+        )
+        change, change_usage = self._discover_branch(
+            name,
+            BTC_CHANGE_BRANCH,
+            backend,
+        )
+        commit_discovered_addresses(
+            name,
+            receive_usage,
+            change_usage,
+            wallet_file=self.wallet_file,
+            address_type=self.address_type,
+            network=self.network,
+        )
+        return WalletDiscovery(receive, change)
+
+    def _discover_branch(
+        self,
+        name: str,
+        branch: int,
+        backend,
+    ) -> tuple[BranchDiscovery, dict[int, bool]]:
+        """Find the last-used index using address statistics only."""
+
+        usage: dict[int, bool] = {}
+        consecutive_unused = 0
+        index = 0
+        while consecutive_unused < self.gap_limit:
+            if index >= self.discovery_max_addresses:
+                raise WalletError(
+                    f"wallet discovery incomplete for branch {branch}: safety "
+                    f"limit {self.discovery_max_addresses} reached before a gap "
+                    f"of {self.gap_limit}"
+                )
+            candidate = derive_wallet_address_candidate(
+                name,
+                index,
+                wallet_file=self.wallet_file,
+                change=branch == BTC_CHANGE_BRANCH,
+                address_type=self.address_type,
+                network=self.network,
+            )
+            try:
+                address_data = backend.get_address(candidate["address"])
+            except Exception as exc:
+                raise WalletError(
+                    f"wallet discovery failed at branch {branch} index {index}: {exc}"
+                ) from exc
+            used = _address_stats_have_history(address_data)
+            usage[index] = used
+            consecutive_unused = 0 if used else consecutive_unused + 1
+            index += 1
+
+        used_indexes = tuple(position for position, used in usage.items() if used)
+        last_used = max(used_indexes, default=-1)
+        committed_usage = {
+            position: usage[position] for position in range(last_used + 1)
+        }
+        return BranchDiscovery(branch, index, used_indexes), committed_usage
 
     def get_wallet_state(self, name: str) -> WalletState:
         """Return display-neutral state from wallet metadata and public cache."""
@@ -190,16 +313,13 @@ class WalletService:
         metadata = self._metadata(name)
         receive_address = self.get_receive_address(name)
         if not self.cache_file.exists():
-            return WalletState(metadata, 0, receive_address, (), None, ())
+            return WalletState(metadata, 0, 0, 0, 0, 0, 0, receive_address, (), None, ())
         with locked_cache_file(self.cache_file):
             cache = load_wallet_cache(self.cache_file)
             wallet_cache = cache.get("wallets", {}).get(name)
             if not isinstance(wallet_cache, dict):
-                return WalletState(metadata, 0, receive_address, (), None, ())
-            balance = wallet_cache.get("balance", {})
-            total = balance.get("total", 0) if isinstance(balance, dict) else 0
-            if isinstance(total, bool) or not isinstance(total, int):
-                raise WalletError("wallet cache total balance is invalid")
+                return WalletState(metadata, 0, 0, 0, 0, 0, 0, receive_address, (), None, ())
+            balance = calculate_wallet_balance(wallet_cache)
             transaction_values = wallet_cache.get("transactions", [])
             if not isinstance(transaction_values, list):
                 raise WalletError("wallet cache transaction list is invalid")
@@ -225,7 +345,12 @@ class WalletService:
             synced_at = _parse_timestamp(wallet_cache.get("synced_at"))
         return WalletState(
             metadata,
-            total,
+            balance.authoritative_sats,
+            balance.confirmed_sats,
+            balance.unconfirmed_chain_sats,
+            balance.pending_delta_sats,
+            balance.effective_sats,
+            balance.available_sats,
             receive_address,
             transactions,
             synced_at,
@@ -431,32 +556,6 @@ class WalletService:
         ]
         return max(used_indexes, default=-1) + 1
 
-    def _ensure_import_scan_pool(self, name: str) -> None:
-        address_book = get_wallet_address_book(
-            name,
-            wallet_file=self.wallet_file,
-            address_type=self.address_type,
-            network=self.network,
-        )
-        counts = {
-            branch: sum(
-                1
-                for entry in address_book["addresses"]
-                if entry.get("branch") == branch
-            )
-            for branch in (0, 1)
-        }
-        for branch in (0, 1):
-            while counts[branch] < self.import_scan_size:
-                get_new_address(
-                    name,
-                    wallet_file=self.wallet_file,
-                    change=branch == 1,
-                    address_type=self.address_type,
-                    network=self.network,
-                )
-                counts[branch] += 1
-
     def _read_cached_history(self, name: str) -> tuple[list[dict], bool] | None:
         if not self.cache_file.exists():
             return None
@@ -550,3 +649,30 @@ def _parse_timestamp(value) -> datetime | None:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(timezone.utc)
+
+
+def _address_stats_have_history(address_data: object) -> bool:
+    """Return whether Esplora reports confirmed or mempool address history."""
+
+    if not isinstance(address_data, dict):
+        raise WalletError("wallet discovery backend returned invalid address data")
+
+    transaction_counts = []
+    for field in ("chain_stats", "mempool_stats"):
+        statistics = address_data.get(field)
+        if not isinstance(statistics, dict):
+            raise WalletError(
+                f'wallet discovery backend returned invalid "{field}" data'
+            )
+        transaction_count = statistics.get("tx_count")
+        if (
+            isinstance(transaction_count, bool)
+            or not isinstance(transaction_count, int)
+            or transaction_count < 0
+        ):
+            raise WalletError(
+                f'wallet discovery backend returned invalid "{field}.tx_count"'
+            )
+        transaction_counts.append(transaction_count)
+
+    return any(count > 0 for count in transaction_counts)
