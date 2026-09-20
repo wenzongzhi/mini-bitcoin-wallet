@@ -91,7 +91,7 @@ def review_withdrawal(
     # Tk variables are read only on the UI thread; the worker receives values.
     destination = state.address.get()
     amount_text = state.amount.get()
-    unit = state.unit
+    unit = state.withdrawal_amount_unit
     send_all = state.send_all.get()
 
     def prepare() -> WithdrawalDraft:
@@ -158,15 +158,16 @@ def _confirm_withdrawal(
     review: WithdrawalReview,
 ) -> None:
     action = "Send all" if review.send_all else "Send"
+    display_unit = state.withdrawal_amount_unit
     confirmed = messagebox.askokcancel(
         "Confirm Withdrawal",
         "\n".join(
             (
                 f"Wallet: {review.wallet_name}",
                 f"Network: {review.network}",
-                f"{action}: {review.amount.format(state.unit)} {state.unit.value}",
-                f"Fee: {review.fee.format(state.unit)} {state.unit.value}",
-                f"Total debit: {review.total.format(state.unit)} {state.unit.value}",
+                f"{action}: {review.amount.format(display_unit)} {display_unit.value}",
+                f"Fee: {review.fee.format(display_unit)} {display_unit.value}",
+                f"Total debit: {review.total.format(display_unit)} {display_unit.value}",
                 f"Fee rate: {review.fee_rate_sat_vb} sat/vB",
                 f"To: {review.destination}",
                 f"TXID: {review.txid}",

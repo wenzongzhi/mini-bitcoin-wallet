@@ -16,6 +16,7 @@ operations.
 ```text
 app.py (composition root)
   ├─ pages.py / widgets.py / state.py       presentation (Tkinter)
+  ├─ app_settings.py / settings_dialog.py   product settings
   ├─ sync_coordinator.py                    background refresh policy
   ├─ wallet_core/application.py             use cases
   ├─ wallet_core/models.py + ports.py       domain values and interfaces
@@ -26,8 +27,8 @@ app.py (composition root)
 The GUI adapter may import `wallet.service` and `tx.service`, but must not import
 `wallet_cache` or `tx.workflow`. Wallet JSON parsing, address discovery,
 synchronization, transaction accounting, UTXO reservations, and payment
-lifecycles belong to those Platform services. The adapter stores only the
-product's active-wallet preference and maps Platform DTOs to view models.
+lifecycles belong to those Platform services. The adapter receives the shared
+application settings dependency and maps Platform DTOs to view models.
 
 Product choices stay in the UI layer. For example, Platform transaction DTOs
 contain `network` and `txid`; `explorer_links.py` turns them into the chosen
@@ -47,7 +48,8 @@ file directly.
   address and QR code.
 - Wallet creation and BIP39 import require a wallet name and password.
 - Multiple wallets can be listed and switched without entering a password. The
-  active wallet for each network is remembered in non-secret `settings.json`.
+  active wallet for each network is remembered in non-secret application
+  settings.
 - Wallet Settings can display recovery words, rename a wallet, replace its
   password, or remove it after ownership confirmation.
 - Imported wallets discover receive and change history independently until each
@@ -83,6 +85,29 @@ file directly.
   capped at 15 minutes.
 - Mainnet and Testnet4 use separate wallet, cache, and lock files.
 
+## Application settings
+
+The Settings dialog contains only General, Network, and Storage:
+
+- General persists BTC/sats display, fiat currency, System/Light/Dark theme,
+  and balance privacy.
+- Network selects the default Platform backend or a custom Esplora-compatible
+  endpoint independently for Mainnet and Testnet4. A custom endpoint must pass
+  a background genesis/network check before it can be saved.
+- Storage selects the bitcoin-tool default data directory or the directory
+  containing the network's standard wallet filename. Storage changes take
+  effect after restart; cache paths remain Platform-managed.
+
+`settings.json` uses the strict Version 2 schema and is stored in Mini Bitcoin
+Wallet's stable `platformdirs` configuration directory. It is independent of
+wallet storage and contains no mnemonic, password, private key, or wallet JSON.
+Unknown/old settings versions are rejected rather than guessed or migrated.
+
+On the first Version 2 launch, an existing wallet for the running network beside
+an older source build or packaged executable is selected by directory reference
+only when the corresponding bitcoin-tool default wallet does not exist. Wallet
+files are never moved, copied, merged, or deleted automatically.
+
 Mnemonic discovery queries a public Esplora service and may reveal scanned
 addresses to that service.
 
@@ -99,8 +124,9 @@ Run the isolated Testnet4 wallet with:
 python app-testnet4.py
 ```
 
-It uses `wallets_testnet4.json` and `wallet_cache_testnet4.json`; mainnet data is
-never reused. The window title is marked `TESTNET4`.
+It uses the Platform-standard `wallets_testnet4.json` and
+`wallet_cache_testnet4.json`; mainnet files are never reused. The window title
+is marked `TESTNET4`.
 
 Build windowed, single-file executables from any working directory with:
 
@@ -109,8 +135,10 @@ python build_mainnet.py
 python build_testnet4.py
 ```
 
-The outputs are `dist/mini_bitcoin_wallet.exe` and `dist/mini_bitcoin_wallet_testnet4.exe`. Packaged wallets and
-caches are stored beside the executable, keeping mainnet and Testnet4 isolated.
+The outputs are `dist/mini_bitcoin_wallet.exe` and
+`dist/mini_bitcoin_wallet_testnet4.exe`. By default, packaged builds use the
+bitcoin-tool Platform data directory; Settings → Storage can select another
+directory containing the standard wallet filename.
 
 ## Update the vendored Platform
 
@@ -143,6 +171,7 @@ mini-bitcoin-wallet/
 ├── build_mainnet.py
 ├── build_testnet4.py
 ├── app_settings.py
+├── settings_dialog.py
 ├── adapters/
 ├── icon/
 ├── btc/

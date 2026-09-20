@@ -8,6 +8,8 @@ from tkinter import messagebox
 from app_assets import apply_window_icon
 from state import WalletUIState
 from theme import Theme
+from wallet_dialogs import create_new_wallet, import_wallet
+from wallet_settings_dialog import show_wallet_settings
 from widgets import RoundedButton, ScrollableFrame
 
 
@@ -29,8 +31,8 @@ class WalletManagerDialog(tk.Toplevel):
         self.transient(parent)
         self.configure(bg=theme.BG)
         self.resizable(False, True)
-        self.geometry("430x500")
-        self.minsize(390, 360)
+        self.geometry("460x590")
+        self.minsize(410, 440)
 
         panel = tk.Frame(self, bg=theme.CARD, padx=theme.px(22), pady=theme.px(20))
         panel.pack(fill="both", expand=True, padx=theme.px(14), pady=theme.px(14))
@@ -48,18 +50,61 @@ class WalletManagerDialog(tk.Toplevel):
         self.wallet_list = self.wallet_scroller.content
         self._render_wallets()
 
-        has_wallets = bool(state.wallets)
+        action_row = tk.Frame(panel, bg=theme.CARD, bd=0)
+        action_row.pack(fill="x", pady=(theme.px(12), 0))
+        for column in range(3):
+            action_row.grid_columnconfigure(column, weight=1)
         RoundedButton(
+            action_row,
+            theme,
+            text="CREATE",
+            command=self._create_wallet,
+            fill=theme.PURPLE_SOFT,
+            height=42,
+            radius=14,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, theme.px(4)))
+        RoundedButton(
+            action_row,
+            theme,
+            text="IMPORT",
+            command=self._import_wallet,
+            fill=theme.PURPLE_SOFT,
+            height=42,
+            radius=14,
+        ).grid(row=0, column=1, sticky="ew", padx=theme.px(4))
+        self.wallet_settings_button = RoundedButton(
+            action_row,
+            theme,
+            text="SETTINGS",
+            command=self._open_wallet_settings,
+            fill=theme.PURPLE_SOFT,
+            height=42,
+            radius=14,
+        )
+        self.wallet_settings_button.grid(
+            row=0,
+            column=2,
+            sticky="ew",
+            padx=(theme.px(4), 0),
+        )
+
+        self.open_button = RoundedButton(
             panel,
             theme,
             text="OPEN WALLET",
-            command=self._open_selected if has_wallets else None,
-            fill=theme.PURPLE if has_wallets else theme.TRACK_OFF,
+            command=self._open_selected,
             height=50,
             radius=16,
-        ).pack(fill="x", pady=(theme.px(14), 0))
+        )
+        self.open_button.pack(fill="x", pady=(theme.px(10), 0))
 
-        self.bind("<Escape>", lambda _event: self.destroy())
+        self._revision_trace = state.revision.trace_add(
+            "write", lambda *_: self._wallet_state_changed()
+        )
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self._update_actions()
+
+        self.bind("<Escape>", lambda _event: self._close())
         self.bind("<Return>", lambda _event: self._open_selected())
         self.grab_set()
         self.after_idle(self.focus_set)
@@ -71,7 +116,7 @@ class WalletManagerDialog(tk.Toplevel):
         if not self.state.wallets:
             tk.Label(
                 self.wallet_list,
-                text="No wallets yet.\nUse Create New Wallet or Import Wallet from Home.",
+                text="No wallets yet.\nUse Create or Import below to add one.",
                 bg=self.theme.CARD,
                 fg=self.theme.MUTED,
                 font=self.theme.font_body,
@@ -148,6 +193,7 @@ class WalletManagerDialog(tk.Toplevel):
     def _select_row(self, wallet_name: str) -> None:
         self.selected_name = wallet_name
         self._render_wallets()
+        self._update_actions()
 
     def _open_selected(self) -> None:
         if self.selected_name is not None:
@@ -159,6 +205,51 @@ class WalletManagerDialog(tk.Toplevel):
         except ValueError as exc:
             messagebox.showerror("Open Wallet", str(exc), parent=self)
             return
+        self._close()
+
+    def _create_wallet(self) -> None:
+        if create_new_wallet(self, self.state):
+            self.selected_name = self.state.active_wallet_name
+            self._wallet_state_changed()
+
+    def _import_wallet(self) -> None:
+        import_wallet(self, self.state)
+
+    def _open_wallet_settings(self) -> None:
+        if self.selected_name is None:
+            return
+        if self.selected_name != self.state.active_wallet_name:
+            try:
+                self.state.select_wallet(self.selected_name)
+            except ValueError as exc:
+                messagebox.showerror("Open Wallet", str(exc), parent=self)
+                return
+        dialog = show_wallet_settings(self, self.theme, self.state)
+        self.wait_window(dialog)
+        if self.winfo_exists():
+            self._wallet_state_changed()
+            self.grab_set()
+
+    def _wallet_state_changed(self) -> None:
+        if not self.winfo_exists():
+            return
+        if self.state.active_wallet_name is not None:
+            self.selected_name = self.state.active_wallet_name
+        self._render_wallets()
+        self._update_actions()
+
+    def _update_actions(self) -> None:
+        has_selection = self.selected_name is not None and bool(self.state.wallets)
+        fill = self.theme.PURPLE if has_selection else self.theme.TRACK_OFF
+        for button in (self.open_button, self.wallet_settings_button):
+            button.set_fill(fill)
+            button.configure(cursor="hand2" if has_selection else "arrow")
+
+    def _close(self) -> None:
+        try:
+            self.state.revision.trace_remove("write", self._revision_trace)
+        except tk.TclError:
+            pass
         self.destroy()
 
 

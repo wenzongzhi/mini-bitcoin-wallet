@@ -7,6 +7,34 @@ from app_assets import BITCOIN_LOGO_PATH
 SUPERSAMPLE = 4
 
 
+def _semantic_colour_role(theme: Theme, colour: str | None) -> str | None:
+    """Return the palette role represented by ``colour``, when applicable."""
+
+    if colour is None:
+        return None
+    for role in (
+        "BG",
+        "CARD",
+        "TEXT",
+        "TEXT_SOFT",
+        "MUTED",
+        "MUTED_2",
+        "BORDER",
+        "INPUT_BG",
+        "PURPLE",
+        "PURPLE_SOFT",
+        "GREEN",
+        "ORANGE",
+        "TRACK_OFF",
+        "SCROLL_THUMB",
+        "SCROLL_THUMB_ACTIVE",
+        "SCROLL_ARROW",
+    ):
+        if colour.lower() == getattr(theme, role).lower():
+            return role
+    return None
+
+
 def _scroll_thumb_bounds(first, last, track_top, track_bottom, minimum_length):
     """Calculate thumb coordinates while preserving a usable drag target."""
 
@@ -78,6 +106,7 @@ class RoundedScrollbar(tk.Canvas):
         self.bind("<Home>", lambda _event: self._move_to(0.0))
         self.bind("<End>", lambda _event: self._move_to(1.0))
         self.bind("<<UIScaleChanged>>", self._rescale, add="+")
+        self.bind("<<ThemeChanged>>", self._theme_changed, add="+")
 
     def set(self, first, last):
         """Receive the visible content fractions from ``Canvas.yview``."""
@@ -218,6 +247,10 @@ class RoundedScrollbar(tk.Canvas):
         self.configure(width=self.theme.px(16))
         self._draw()
 
+    def _theme_changed(self, _event=None):
+        self.configure(bg=self.theme.CARD)
+        self._draw()
+
 
 class ScrollableFrame(tk.Frame):
     """Vertical content area supporting wheel, scrollbar, touch, and keyboard."""
@@ -297,8 +330,26 @@ class AARoundedCanvas(tk.Canvas):
     def __init__(self, master, theme: Theme, parent_bg=None, **kwargs):
         self.theme = theme
         self.parent_bg = parent_bg or theme.CARD
+        self._parent_colour_role = _semantic_colour_role(theme, self.parent_bg)
         self._corner_cache = {}
         super().__init__(master, bg=self.parent_bg, highlightthickness=0, bd=0, **kwargs)
+        self.bind("<<ThemeChanged>>", self._theme_changed, add="+")
+
+    def _theme_changed(self, _event=None):
+        """Refresh anti-aliased Canvas artwork after a palette change."""
+
+        if self._parent_colour_role is not None:
+            self.parent_bg = getattr(self.theme, self._parent_colour_role)
+            self.configure(bg=self.parent_bg)
+        self._corner_cache.clear()
+        refresh_colours = getattr(self, "_refresh_theme_colours", None)
+        if refresh_colours is not None:
+            refresh_colours()
+        redraw = getattr(self, "_draw", None)
+        if redraw is None:
+            redraw = getattr(self, "_layout", None)
+        if redraw is not None:
+            redraw()
 
     def _corners(self, radius, fill):
         key = (int(radius), fill)
@@ -352,6 +403,7 @@ class PillowToggle(tk.Canvas):
         self.bind("<Button-1>", self._toggle)
         self.bind("<Configure>", self._draw)
         self.bind("<<UIScaleChanged>>", self._rescale, add="+")
+        self.bind("<<ThemeChanged>>", self._theme_changed, add="+")
 
     def set_checked(self, checked):
         self.checked = bool(checked)
@@ -359,6 +411,10 @@ class PillowToggle(tk.Canvas):
 
     def _rescale(self, event=None):
         self.configure(width=self.theme.px(42), height=self.theme.px(24))
+        self._draw()
+
+    def _theme_changed(self, _event=None):
+        self.configure(bg=self.theme.CARD)
         self._draw()
 
     def _toggle(self, event=None):
@@ -374,11 +430,14 @@ class PillowToggle(tk.Canvas):
         image = Image.new("RGBA", (w * s, h * s), (0, 0, 0, 0))
         d = ImageDraw.Draw(image)
         d.rounded_rectangle([0, 0, w * s - 1, h * s - 1], radius=h * s // 2,
-                            fill=self.theme.PURPLE if self.checked else "#B8C0C8")
+                            fill=self.theme.PURPLE if self.checked else self.theme.TRACK_OFF)
         margin = max(2, int(round(3 * self.theme.scale)))
         knob = h - margin * 2
         x = w - knob - margin if self.checked else margin
-        d.ellipse([x * s, margin * s, (x + knob) * s, (margin + knob) * s], fill="#FFFFFF")
+        d.ellipse(
+            [x * s, margin * s, (x + knob) * s, (margin + knob) * s],
+            fill=self.theme.CARD,
+        )
         image = image.resize((w, h), Image.Resampling.LANCZOS)
         self._photo = ImageTk.PhotoImage(image)
         self.delete("all")
@@ -392,12 +451,27 @@ class RoundedButton(AARoundedCanvas):
         self.command = command
         self.fill = fill or theme.PURPLE
         self.text_fill = text_fill
+        self._fill_colour_role = _semantic_colour_role(theme, self.fill)
+        self._text_colour_role = _semantic_colour_role(theme, self.text_fill)
         self.base_radius = radius
         self.base_height = height
         super().__init__(master, theme, parent_bg=theme.CARD, cursor="hand2", height=theme.px(height))
         self.bind("<Configure>", self._draw)
         self.bind("<Button-1>", lambda e: self.command() if self.command else None)
         self.bind("<<UIScaleChanged>>", self._rescale, add="+")
+
+    def set_fill(self, colour: str) -> None:
+        """Update the button colour while retaining live-theme behaviour."""
+
+        self.fill = colour
+        self._fill_colour_role = _semantic_colour_role(self.theme, colour)
+        self._draw()
+
+    def _refresh_theme_colours(self):
+        if self._fill_colour_role is not None:
+            self.fill = getattr(self.theme, self._fill_colour_role)
+        if self._text_colour_role is not None:
+            self.text_fill = getattr(self.theme, self._text_colour_role)
 
     def _rescale(self, event=None):
         self.configure(height=self.theme.px(self.base_height))
@@ -601,6 +675,11 @@ class SegmentedControl(tk.Canvas):
         self.bind("<Button-1>", self._click)
         self.bind("<Configure>", self._draw)
         self.bind("<<UIScaleChanged>>", self._draw, add="+")
+        self.bind("<<ThemeChanged>>", self._theme_changed, add="+")
+
+    def _theme_changed(self, _event=None):
+        self.configure(bg=self.theme.INPUT_BG)
+        self._draw()
 
     def set_value(self, value):
         if value in ("Sats", "BTC"):
@@ -622,10 +701,18 @@ class SegmentedControl(tk.Canvas):
         img = Image.new("RGBA", (w*s, h*s), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         r = h*s//2
-        d.rounded_rectangle([0, 0, w*s-1, h*s-1], radius=r, fill="#E9ECEC")
+        d.rounded_rectangle(
+            [0, 0, w*s-1, h*s-1],
+            radius=r,
+            fill=self.theme.TRACK_OFF,
+        )
         half = w*s//2
         box = [2*s, 2*s, half+2*s, h*s-2*s] if self.value == "Sats" else [half-2*s, 2*s, w*s-2*s, h*s-2*s]
-        d.rounded_rectangle(box, radius=max(1, r-2*s), fill="#FFFFFF")
+        d.rounded_rectangle(
+            box,
+            radius=max(1, r-2*s),
+            fill=self.theme.CARD,
+        )
         img = img.resize((w, h), Image.Resampling.LANCZOS)
         self._photo = ImageTk.PhotoImage(img)
         self.delete("all")
@@ -675,23 +762,31 @@ class FeeTooltip:
         self.owner = owner
         self.theme = theme
         self.window = None
+        self.arrow = None
 
     def show(self, text, root_x, root_y):
         if self.window is None:
             top = tk.Toplevel(self.owner)
             top.withdraw()
             top.overrideredirect(True)
-            top.configure(bg="#FFFFFF", bd=1, relief="solid")
+            top.configure(bg=self.theme.CARD, bd=1, relief="solid")
             try:
                 top.attributes("-topmost", True)
             except tk.TclError:
                 pass
-            self.label = tk.Label(top, text="", bg="#FFFFFF", fg=self.theme.TEXT,
+            self.label = tk.Label(top, text="", bg=self.theme.CARD, fg=self.theme.TEXT,
                                   font=self.theme.font_tooltip, padx=10, pady=6)
             self.label.pack()
-            arrow = tk.Canvas(top, width=18, height=9, bg="#FFFFFF", highlightthickness=0, bd=0)
-            arrow.pack()
-            arrow.create_polygon(2, 0, 16, 0, 9, 8, fill="#FFFFFF", outline=self.theme.BORDER)
+            self.arrow = tk.Canvas(
+                top,
+                width=18,
+                height=9,
+                bg=self.theme.CARD,
+                highlightthickness=0,
+                bd=0,
+            )
+            self.arrow.pack()
+            self._draw_arrow()
             self.window = top
 
         self.label.configure(text=text)
@@ -708,6 +803,29 @@ class FeeTooltip:
     def hide(self):
         if self.window is not None:
             self.window.withdraw()
+
+    def apply_theme(self):
+        if self.window is None:
+            return
+        self.window.configure(bg=self.theme.CARD)
+        self.label.configure(bg=self.theme.CARD, fg=self.theme.TEXT)
+        self.arrow.configure(bg=self.theme.CARD)
+        self._draw_arrow()
+
+    def _draw_arrow(self):
+        if self.arrow is None:
+            return
+        self.arrow.delete("all")
+        self.arrow.create_polygon(
+            2,
+            0,
+            16,
+            0,
+            9,
+            8,
+            fill=self.theme.CARD,
+            outline=self.theme.BORDER,
+        )
 
 
 class FeeSlider(tk.Canvas):
@@ -735,6 +853,7 @@ class FeeSlider(tk.Canvas):
         self.bind("<ButtonRelease-1>", self._release)
         self.bind("<Leave>", self._hide_tooltip)
         self.bind("<<UIScaleChanged>>", self._rescale, add="+")
+        self.bind("<<ThemeChanged>>", self._theme_changed, add="+")
 
     def set_custom(self, custom):
         self.custom = bool(custom)
@@ -755,6 +874,13 @@ class FeeSlider(tk.Canvas):
         self.configure(height=self.theme.px(self.base_height))
         self._track_key = None
         self._knob_key = None
+        self._draw()
+
+    def _theme_changed(self, _event=None):
+        self.configure(bg=self.theme.CARD)
+        self._track_key = None
+        self._knob_key = None
+        self.tooltip.apply_theme()
         self._draw()
 
     def _press(self, event):
@@ -845,10 +971,12 @@ class FeeSlider(tk.Canvas):
         d = max(4, int(diameter))
         img = Image.new("RGBA", (d*s, d*s), (0, 0, 0, 0))
         dr = ImageDraw.Draw(img)
-        dr.ellipse([s, s, (d-1)*s, (d-1)*s],
-                   fill="#FFFFFF" if self.active else "#E5E6E7",
-                   outline="#D0D4D8" if self.active else "#D9DDE0",
-                   width=s)
+        dr.ellipse(
+            [s, s, (d-1)*s, (d-1)*s],
+            fill=self.theme.CARD if self.active else self.theme.TRACK_OFF,
+            outline=self.theme.BORDER,
+            width=s,
+        )
         img = img.resize((d, d), Image.Resampling.LANCZOS)
         self._knob_photo = ImageTk.PhotoImage(img)
         self._knob_key = key
@@ -880,7 +1008,12 @@ class ResponsiveQR(tk.Canvas):
         self._matrix_value = None
         super().__init__(master, bg=theme.CARD, highlightthickness=0, bd=0)
         self.bind("<Configure>", self._draw)
+        self.bind("<<ThemeChanged>>", self._theme_changed, add="+")
         self.textvariable.trace_add("write", self._address_changed)
+
+    def _theme_changed(self, _event=None):
+        self.configure(bg=self.theme.CARD)
+        self._draw()
 
     def _address_changed(self, *_):
         self._matrix = None

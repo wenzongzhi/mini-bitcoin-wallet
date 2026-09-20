@@ -45,10 +45,10 @@ class WalletSettingsDialog(tk.Toplevel):
         self.metadata_label.pack(fill="x", pady=(0, 16))
 
         actions = (
-            ("View secret words…", self._show_mnemonic),
+            ("View recovery words…", self._show_mnemonic),
             ("Rename wallet…", self._rename),
             ("Change password…", self._change_password),
-            ("Remove wallet…", self._remove),
+            ("Remove wallet from this device…", self._remove),
         )
         self.action_buttons: list[tk.Button] = []
         for label, command in actions:
@@ -116,13 +116,13 @@ class WalletSettingsDialog(tk.Toplevel):
         return password is not None, password
 
     def _show_mnemonic(self) -> None:
-        accepted, password = self._ask_current_password("View Secret Words")
+        accepted, password = self._ask_current_password("View Recovery Words")
         if not accepted:
             return
         try:
             mnemonic = self.state.get_mnemonic(password)
         except ValueError as exc:
-            messagebox.showerror("View Secret Words", str(exc), parent=self)
+            messagebox.showerror("View Recovery Words", str(exc), parent=self)
             return
         messagebox.showwarning(
             "Secret Recovery Words",
@@ -213,5 +213,5 @@ def show_wallet_settings(
     parent: tk.Misc,
     theme: Theme,
     state: WalletUIState,
-) -> None:
-    WalletSettingsDialog(parent, theme, state)
+) -> WalletSettingsDialog:
+    return WalletSettingsDialog(parent, theme, state)

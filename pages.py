@@ -8,6 +8,7 @@ from wallet_core import DisplayUnit, TransactionDirection, TransactionSummary
 from wallet_dialogs import create_new_wallet, import_wallet
 from wallet_manager import show_wallet_manager
 from wallet_settings_dialog import show_wallet_settings
+from settings_dialog import show_application_settings
 from widgets import (
     AmountEntry,
     BitcoinLogo,
@@ -59,7 +60,7 @@ class WalletSelector(tk.Frame):
         self.bind("<space>", self._show_menu)
 
     def _show_menu(self, event=None):
-        menu = tk.Menu(self, tearoff=False, font=self.theme.font_small)
+        menu = self._new_menu()
         for wallet in self.state.wallets:
             active = wallet.name == self.state.active_wallet_name
             label = f"{wallet.name}  ✓" if active else wallet.name
@@ -75,6 +76,19 @@ class WalletSelector(tk.Frame):
             menu.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.winfo_height())
         finally:
             menu.grab_release()
+
+    def _new_menu(self) -> tk.Menu:
+        return tk.Menu(
+            self,
+            tearoff=False,
+            font=self.theme.font_small,
+            bg=self.theme.CARD,
+            fg=self.theme.TEXT,
+            activebackground=self.theme.PURPLE,
+            activeforeground="#FFFFFF",
+            selectcolor=self.theme.PURPLE,
+            bd=0,
+        )
 
     def _select_wallet(self, wallet_name: str) -> None:
         try:
@@ -129,6 +143,7 @@ class WalletHeader(tk.Frame):
         BitcoinLogo(self.right, theme).pack(anchor="e")
 
         state.display_unit.trace_add("write", lambda *_: self._update_balance())
+        state.hide_balance.trace_add("write", lambda *_: self._update_balance())
         state.revision.trace_add("write", lambda *_: self._update_balance())
         self.bind("<Configure>", self._schedule_balance_fit, add="+")
         self.bind("<<UIScaleChanged>>", self._schedule_balance_fit, add="+")
@@ -162,22 +177,26 @@ class WalletHeader(tk.Frame):
             self.balance_font.configure(size=fitted_size)
 
     def _build_menu(self):
-        menu = tk.Menu(self, tearoff=False, font=self.theme.font_small)
-        menu.add_command(label="Create new wallet...", command=self._create_wallet)
-        menu.add_command(label="Import secret words...", command=self._import_wallet)
+        menu = tk.Menu(
+            self,
+            tearoff=False,
+            font=self.theme.font_small,
+            bg=self.theme.CARD,
+            fg=self.theme.TEXT,
+            activebackground=self.theme.PURPLE,
+            activeforeground="#FFFFFF",
+            selectcolor=self.theme.PURPLE,
+            bd=0,
+        )
+        menu.add_command(label="Create New Wallet...", command=self._create_wallet)
+        menu.add_command(label="Import Wallet...", command=self._import_wallet)
         menu.add_separator()
-        settings = tk.Menu(menu, tearoff=False, font=self.theme.font_small)
-        settings.add_command(label="Wallets...", command=self._manage_wallets)
-        settings.add_separator()
-        fiat = tk.Menu(settings, tearoff=False, font=self.theme.font_small)
-        for code in ("USD", "JPY", "CNY", "EUR"):
-            fiat.add_radiobutton(label=code, value=code, variable=self.state.fiat_currency)
-        settings.add_cascade(label="Fiat currency", menu=fiat)
-        settings.add_checkbutton(label="Dark mode", variable=self.state.dark_mode)
-        settings.add_separator()
-        settings.add_command(label="Wallet Settings...", command=self._wallet_settings)
-        menu.add_cascade(label="Settings", menu=settings)
-        menu.add_command(label="About this wallet", command=self._show_about)
+        menu.add_command(label="Manage Wallets...", command=self._manage_wallets)
+        menu.add_command(label="Wallet Settings...", command=self._wallet_settings)
+        self._wallet_settings_menu_index = menu.index("end")
+        menu.add_separator()
+        menu.add_command(label="Settings...", command=self._application_settings)
+        menu.add_command(label="About...", command=self._show_about)
         return menu
 
     def _create_wallet(self):
@@ -192,10 +211,17 @@ class WalletHeader(tk.Frame):
     def _wallet_settings(self):
         show_wallet_settings(self.winfo_toplevel(), self.theme, self.state)
 
+    def _application_settings(self):
+        show_application_settings(self.winfo_toplevel(), self.theme, self.state)
+
     def _show_about(self):
         show_about_wallet(self.winfo_toplevel(), self.theme)
 
     def _show_menu(self, event):
+        self.menu.entryconfigure(
+            self._wallet_settings_menu_index,
+            state="normal" if self.state.is_initialized else "disabled",
+        )
         try:
             self.menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -212,7 +238,14 @@ class BackButton(tk.Label):
 
 
 class TransactionItem(tk.Frame):
-    def __init__(self, master, theme: Theme, transaction: TransactionSummary, command):
+    def __init__(
+        self,
+        master,
+        theme: Theme,
+        transaction: TransactionSummary,
+        display_unit: DisplayUnit,
+        command,
+    ):
         super().__init__(
             master,
             bg=theme.CARD,
@@ -230,7 +263,7 @@ class TransactionItem(tk.Frame):
             TransactionDirection.SELF: "Internal transfer",
         }[transaction.direction]
         amount = transaction.amount.format(
-            DisplayUnit.BTC,
+            display_unit,
             signed=transaction.direction is not TransactionDirection.SELF,
         )
         icon = {
@@ -249,7 +282,7 @@ class TransactionItem(tk.Frame):
                  font=theme.font_small, anchor="w").grid(row=1, column=1, sticky="ew", pady=(theme.px(2), 0))
         tk.Label(self, text=amount, bg=theme.CARD, fg=theme.TEXT_SOFT,
                  font=theme.font_body_bold, anchor="e").grid(row=0, column=2, sticky="e")
-        tk.Label(self, text="BTC", bg=theme.CARD, fg=theme.MUTED_2,
+        tk.Label(self, text=display_unit.value, bg=theme.CARD, fg=theme.MUTED_2,
                  font=theme.font_small, anchor="e").grid(row=1, column=2, sticky="e", pady=(theme.px(2), 0))
         self._bind_activation(self)
         self.bind("<Return>", self._activate)
@@ -340,6 +373,7 @@ class HomePage(PageBase):
             pady=(theme.px(4), theme.px(8)),
         )
         state.revision.trace_add("write", lambda *_: self._render_transactions())
+        state.display_unit.trace_add("write", lambda *_: self._render_transactions())
         self._render_transactions()
         DualActionBar(c, theme, left_command=on_send, right_command=on_receive).grid(
             row=3, column=0, sticky="ew", padx=theme.px(5), pady=(theme.px(6), theme.px(5)))
@@ -378,6 +412,7 @@ class HomePage(PageBase):
                 content,
                 self.theme,
                 transaction,
+                self.state.unit,
                 command=lambda selected=transaction: self._show_transaction(selected),
             )
             item.grid(
@@ -438,7 +473,12 @@ class HomePage(PageBase):
         return "break"
 
     def _show_transaction(self, transaction):
-        show_transaction_details(self.winfo_toplevel(), self.theme, transaction)
+        show_transaction_details(
+            self.winfo_toplevel(),
+            self.theme,
+            transaction,
+            self.state.unit,
+        )
 
 
 class ReceivePage(PageBase):
@@ -504,16 +544,16 @@ class FeeAxis(tk.Frame):
         if self.custom:
             self.grid_columnconfigure(0, weight=1)
             self.grid_columnconfigure(1, weight=1)
-            tk.Label(self, text="Slow · 0 sat/vB", bg=self.theme.CARD, fg="#B3B8BD",
+            tk.Label(self, text="Slow · 0 sat/vB", bg=self.theme.CARD, fg=self.theme.MUTED_2,
                      font=self.theme.font_small, anchor="w").grid(row=0, column=0, sticky="ew")
-            tk.Label(self, text="Fast · 20 sat/vB", bg=self.theme.CARD, fg="#B3B8BD",
+            tk.Label(self, text="Fast · 20 sat/vB", bg=self.theme.CARD, fg=self.theme.MUTED_2,
                      font=self.theme.font_small, anchor="e").grid(row=0, column=1, sticky="ew")
         else:
             labels = ("~ 24 hrs", "~ 4 hrs", "~ 60 min", "~ 10 min")
             for i, text in enumerate(labels):
                 self.grid_columnconfigure(i, weight=1)
                 anchor = "w" if i == 0 else ("e" if i == 3 else "center")
-                tk.Label(self, text=text, bg=self.theme.CARD, fg="#B3B8BD",
+                tk.Label(self, text=text, bg=self.theme.CARD, fg=self.theme.MUTED_2,
                          font=self.theme.font_small, anchor=anchor).grid(row=0, column=i, sticky="ew")
 
 
@@ -552,7 +592,7 @@ class SendPage(PageBase):
                  font=theme.font_small).pack(side="left")
 
         self.amount_entry = AmountEntry(form, theme, textvariable=state.amount,
-                                        unit=state.display_unit.get(), unit_command=self._change_unit)
+                                        unit=state.withdrawal_unit.get(), unit_command=self._change_unit)
         self.amount_entry.grid(row=1, column=0, sticky="ew", pady=(0, theme.px(8)))
 
         tk.Label(form, text="Address", bg=theme.CARD, fg=theme.TEXT,
@@ -593,15 +633,15 @@ class SendPage(PageBase):
 
         state.amount.trace_add("write", lambda *_: self._update_fee_active())
         state.address.trace_add("write", lambda *_: self._update_fee_active())
-        state.display_unit.trace_add("write", lambda *_: self._sync_segment())
+        state.withdrawal_unit.trace_add("write", lambda *_: self._sync_segment())
         state.revision.trace_add("write", lambda *_: self._wallet_changed())
         self._update_fee_active()
 
     def _change_unit(self, unit):
-        self.state.display_unit.set(unit)
+        self.state.withdrawal_unit.set(unit)
 
     def _sync_segment(self):
-        self.amount_entry.segment.set_value(self.state.display_unit.get())
+        self.amount_entry.segment.set_value(self.state.withdrawal_unit.get())
 
     def _toggle_custom(self, checked):
         self.state.custom_fee.set(bool(checked))

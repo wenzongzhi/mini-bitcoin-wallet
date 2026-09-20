@@ -31,7 +31,13 @@ def format_transaction_time(transaction: TransactionSummary, *, detailed=False) 
 
 
 class TransactionDetailsDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Misc, theme: Theme, transaction: TransactionSummary):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        theme: Theme,
+        transaction: TransactionSummary,
+        display_unit: DisplayUnit = DisplayUnit.BTC,
+    ):
         super().__init__(parent)
         # A new Toplevel is otherwise mapped at its default 1x1 geometry before
         # Tk has measured the real content, which produces a visible flash.
@@ -53,10 +59,23 @@ class TransactionDetailsDialog(tk.Toplevel):
 
         rows = (
             ("Type", _DIRECTION_LABELS[transaction.direction]),
-            ("Net amount", f"{transaction.amount.format(DisplayUnit.BTC, signed=True)} BTC"),
-            ("Received", f"{transaction.received.format(DisplayUnit.BTC)} BTC"),
-            ("Sent", f"{transaction.sent.format(DisplayUnit.BTC)} BTC"),
-            ("Fee", f"{transaction.fee.format(DisplayUnit.SATS)} sats"),
+            (
+                "Net amount",
+                f"{transaction.amount.format(display_unit, signed=True)} "
+                f"{display_unit.value}",
+            ),
+            (
+                "Received",
+                f"{transaction.received.format(display_unit)} {display_unit.value}",
+            ),
+            (
+                "Sent",
+                f"{transaction.sent.format(display_unit)} {display_unit.value}",
+            ),
+            (
+                "Fee",
+                f"{transaction.fee.format(display_unit)} {display_unit.value}",
+            ),
             ("Time", format_transaction_time(transaction, detailed=True)),
             ("Status", "Confirmed" if transaction.confirmed else "Unconfirmed"),
             ("Confirmations", str(transaction.confirmations)),
@@ -192,6 +211,9 @@ class TransactionDetailsDialog(tk.Toplevel):
 
 
 def show_transaction_details(
-    parent: tk.Misc, theme: Theme, transaction: TransactionSummary
+    parent: tk.Misc,
+    theme: Theme,
+    transaction: TransactionSummary,
+    display_unit: DisplayUnit = DisplayUnit.BTC,
 ) -> TransactionDetailsDialog:
-    return TransactionDetailsDialog(parent, theme, transaction)
+    return TransactionDetailsDialog(parent, theme, transaction, display_unit)

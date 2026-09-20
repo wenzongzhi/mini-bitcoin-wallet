@@ -6,6 +6,7 @@ Business rules live in :mod:`wallet_core`; pages only coordinate presentation.
 
 import tkinter as tk
 
+from app_settings import ApplicationSettingsStore, GeneralSettings
 from wallet_core import (
     BitcoinAmount,
     DisplayUnit,
@@ -19,22 +20,79 @@ from wallet_core import (
 )
 
 
+HIDDEN_BALANCE_TEXT = "••••••••"
+_SETTING_TO_DISPLAY_UNIT = {
+    "BTC": DisplayUnit.BTC,
+    "sats": DisplayUnit.SATS,
+}
+_DISPLAY_UNIT_TO_SETTING = {
+    unit: setting for setting, unit in _SETTING_TO_DISPLAY_UNIT.items()
+}
+
+
+def display_unit_from_setting(value: str) -> DisplayUnit:
+    """Translate the stable settings schema into the UI display enum."""
+
+    try:
+        return _SETTING_TO_DISPLAY_UNIT[value]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Unsupported Bitcoin display unit: {value!r}.") from exc
+
+
+def display_unit_to_setting(unit: DisplayUnit) -> str:
+    """Translate a UI display enum into the stable settings schema."""
+
+    try:
+        return _DISPLAY_UNIT_TO_SETTING[unit]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Unsupported Bitcoin display unit: {unit!r}.") from exc
+
+
+def format_wallet_balance(
+    balance: BitcoinAmount,
+    unit: DisplayUnit,
+    *,
+    hidden: bool,
+) -> tuple[str, str]:
+    """Format the home balance without leaking its magnitude when hidden."""
+
+    value = HIDDEN_BALANCE_TEXT if hidden else balance.format(unit)
+    return value, unit.value
+
+
 class WalletUIState:
-    def __init__(self, root: tk.Misc, application: WalletApplication):
+    def __init__(
+        self,
+        root: tk.Misc,
+        application: WalletApplication,
+        settings_store: ApplicationSettingsStore,
+        network: str,
+    ):
         self.root = root
         self.application = application
+        self.settings_store = settings_store
+        self.network = network
         self._snapshot = application.load_wallet()
         self._wallets = application.list_wallets()
+        general = settings_store.general()
+        initial_unit = display_unit_from_setting(general.display_unit).value
 
-        self.display_unit = tk.StringVar(root, value=DisplayUnit.BTC.value)
+        self.display_unit = tk.StringVar(
+            root,
+            value=initial_unit,
+        )
+        # The Send amount selector is an input choice, not another way to edit
+        # the persisted application-wide display preference.
+        self.withdrawal_unit = tk.StringVar(root, value=initial_unit)
         self.wallet_name = tk.StringVar(root, value=self._snapshot.name)
         self.receive_address = tk.StringVar(root, value=self._snapshot.receive_address)
         self.amount = tk.StringVar(root, value="")
         self.address = tk.StringVar(root, value="")
         self.send_all = tk.BooleanVar(root, value=False)
         self.custom_fee = tk.BooleanVar(root, value=False)
-        self.fiat_currency = tk.StringVar(root, value="USD")
-        self.dark_mode = tk.BooleanVar(root, value=False)
+        self.fiat_currency = tk.StringVar(root, value=general.fiat_currency)
+        self.theme_mode = tk.StringVar(root, value=general.theme)
+        self.hide_balance = tk.BooleanVar(root, value=general.hide_balance)
         self.sync_status = tk.StringVar(root, value="")
         self.syncing = tk.BooleanVar(root, value=False)
         self.revision = tk.IntVar(root, value=0)
@@ -77,11 +135,33 @@ class WalletUIState:
         return DisplayUnit(self.display_unit.get())
 
     @property
+    def withdrawal_amount_unit(self) -> DisplayUnit:
+        return DisplayUnit(self.withdrawal_unit.get())
+
+    @property
     def is_initialized(self) -> bool:
         return self._snapshot.is_initialized
 
     def formatted_balance(self) -> tuple[str, str]:
-        return self._snapshot.balance.format(self.unit), self.unit.value
+        return format_wallet_balance(
+            self._snapshot.balance,
+            self.unit,
+            hidden=self.hide_balance.get(),
+        )
+
+    def apply_general_settings(self, general: GeneralSettings) -> None:
+        """Apply already-persisted presentation settings to the live UI."""
+
+        unit = display_unit_from_setting(general.display_unit)
+        if not isinstance(general.hide_balance, bool):
+            raise ValueError("Hide balance must be true or false.")
+
+        self.display_unit.set(unit.value)
+        self.withdrawal_unit.set(unit.value)
+        self.fiat_currency.set(general.fiat_currency)
+        self.theme_mode.set(general.theme)
+        self.hide_balance.set(general.hide_balance)
+        self._announce("<<ApplicationSettingsChanged>>")
 
     def get_mnemonic(self, password: str | None) -> str:
         return self.application.get_mnemonic(password)
@@ -165,7 +245,7 @@ class WalletUIState:
         try:
             # Parsing here gives immediate feedback. The use case repeats the
             # check at its own trust boundary before preparing a transaction.
-            BitcoinAmount.parse(self.amount.get(), self.unit)
+            BitcoinAmount.parse(self.amount.get(), self.withdrawal_amount_unit)
             return True
         except ValueError:
             return False
@@ -174,7 +254,7 @@ class WalletUIState:
         return self.application.prepare_withdrawal(
             self.address.get(),
             self.amount.get(),
-            self.unit,
+            self.withdrawal_amount_unit,
             fee_rate_sat_vb,
             send_all=self.send_all.get(),
         )
@@ -202,6 +282,8 @@ class WalletUIState:
         self._announce("<<WalletBroadcast>>")
 
     def fiat_zero_text(self) -> str:
+        if self.hide_balance.get():
+            return HIDDEN_BALANCE_TEXT
         return {
             "USD": "US$0.00",
             "JPY": "¥0",

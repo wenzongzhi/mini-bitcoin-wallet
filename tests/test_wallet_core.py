@@ -189,9 +189,14 @@ class BitcoinToolWalletServiceTests(TestCase):
         self.temporary_directory = TemporaryDirectory()
         data_directory = Path(self.temporary_directory.name)
         self.wallet_file = data_directory / "wallets.json"
+        self.settings_store = ApplicationSettingsStore(
+            data_directory / "settings.json"
+        )
+        self.settings_store.ensure_exists()
         self.service = BitcoinToolWalletService(
             self.wallet_file,
             data_directory / "wallet_cache.json",
+            settings_store=self.settings_store,
         )
 
     def tearDown(self):
@@ -204,16 +209,8 @@ class BitcoinToolWalletServiceTests(TestCase):
         self.assertEqual(snapshot.receive_address, "")
         self.assertEqual(snapshot.transactions, ())
         self.assertEqual(self.service.list_wallets(), ())
-        settings = json.loads(
-            (self.wallet_file.parent / "settings.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(
-            settings,
-            {
-                "version": 1,
-                "active_wallets": {"mainnet": None, "testnet4": None},
-            },
-        )
+        self.assertIs(self.service.settings_store, self.settings_store)
+        self.assertIsNone(self.settings_store.active_wallet("mainnet"))
 
     def test_multiple_wallets_can_coexist_and_be_listed_without_secrets(self):
         mnemonics = []
@@ -274,6 +271,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         restarted = BitcoinToolWalletService(
             self.wallet_file,
             self.wallet_file.parent / "wallet_cache.json",
+            settings_store=self.settings_store,
         )
 
         self.assertEqual(restarted.snapshot().name, "Wallet_B")
@@ -281,16 +279,16 @@ class BitcoinToolWalletServiceTests(TestCase):
     def test_missing_active_wallet_falls_back_to_first_wallet(self):
         self.service.create_wallet("Wallet_A", "password-a")
         self.service.create_wallet("Wallet_B", "password-b")
-        settings = ApplicationSettingsStore(self.wallet_file.parent / "settings.json")
-        settings.set_active_wallet("mainnet", "missing-wallet")
+        self.settings_store.set_active_wallet("mainnet", "missing-wallet")
 
         restarted = BitcoinToolWalletService(
             self.wallet_file,
             self.wallet_file.parent / "wallet_cache.json",
+            settings_store=self.settings_store,
         )
 
         self.assertEqual(restarted.snapshot().name, "Wallet_A")
-        self.assertEqual(settings.active_wallet("mainnet"), "Wallet_A")
+        self.assertEqual(self.settings_store.active_wallet("mainnet"), "Wallet_A")
 
     def test_selecting_unknown_wallet_does_not_change_active_wallet(self):
         self.service.create_wallet("Wallet_A", "password-a")
@@ -306,14 +304,13 @@ class BitcoinToolWalletServiceTests(TestCase):
         testnet_service = BitcoinToolWalletService(
             data_directory / "wallets_testnet4.json",
             data_directory / "wallet_cache_testnet4.json",
+            settings_store=self.settings_store,
             network=NETWORK_TESTNET4,
-            settings_file=data_directory / "settings.json",
         )
         testnet_service.create_wallet("TestWallet", "test-password")
 
-        settings = ApplicationSettingsStore(data_directory / "settings.json")
-        self.assertEqual(settings.active_wallet("mainnet"), "MainWallet")
-        self.assertEqual(settings.active_wallet("testnet4"), "TestWallet")
+        self.assertEqual(self.settings_store.active_wallet("mainnet"), "MainWallet")
+        self.assertEqual(self.settings_store.active_wallet("testnet4"), "TestWallet")
 
     def test_create_wallet_encrypts_mnemonic_and_issues_one_receive_address(self):
         creation = self.service.create_wallet("alice", "correct horse battery staple")
@@ -337,6 +334,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         imported_service = BitcoinToolWalletService(
             imported_file,
             Path(self.temporary_directory.name) / "imported-cache.json",
+            settings_store=self.settings_store,
             backend_factory=lambda network: FakeEsploraBackend(network),
         )
         imported = imported_service.import_wallet(
@@ -360,6 +358,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         discovered_service = BitcoinToolWalletService(
             data_directory / "discovered-wallets.json",
             data_directory / "discovered-cache.json",
+            settings_store=self.settings_store,
             # Reuse one ordinal-based fake so an address keeps the same
             # identity between lightweight discovery and the following sync.
             backend_factory=lambda _network: discovery_backend,
@@ -411,6 +410,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         testnet_service = BitcoinToolWalletService(
             data_directory / "wallets_testnet4.json",
             data_directory / "wallet_cache_testnet4.json",
+            settings_store=self.settings_store,
             network=NETWORK_TESTNET4,
         )
         creation = testnet_service.create_wallet("testnet", "test-password")
@@ -428,6 +428,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         testnet_service = BitcoinToolWalletService(
             data_directory / "restored_testnet4.json",
             data_directory / "restored_testnet4_cache.json",
+            settings_store=self.settings_store,
             network=NETWORK_TESTNET4,
             backend_factory=lambda _network: discovery_backend,
         )
@@ -462,6 +463,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         service = BitcoinToolWalletService(
             self.wallet_file,
             self.wallet_file.parent / "send-cache.json",
+            settings_store=self.settings_store,
             backend_factory=funded_backend,
         )
         service.create_wallet("Wallet_A", "password-a")
@@ -506,6 +508,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         service = BitcoinToolWalletService(
             self.wallet_file,
             self.wallet_file.parent / "history-cache.json",
+            settings_store=self.settings_store,
             backend_factory=lambda _network: backend,
         )
         service.create_wallet("HistoryWallet", "password")
@@ -531,6 +534,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         service = BitcoinToolWalletService(
             self.wallet_file,
             self.wallet_file.parent / "sync-cache.json",
+            settings_store=self.settings_store,
             backend_factory=lambda _network: backend,
         )
         service.create_wallet("SyncWallet", "password")
@@ -553,6 +557,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         service = BitcoinToolWalletService(
             self.wallet_file,
             self.wallet_file.parent / "preflight-cache.json",
+            settings_store=self.settings_store,
             backend_factory=lambda network: FakeEsploraBackend(
                 network, funded_ordinals={0: 100_000}
             ),
@@ -577,6 +582,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         service = BitcoinToolWalletService(
             self.wallet_file,
             cache_file,
+            settings_store=self.settings_store,
             backend_factory=lambda network: FakeEsploraBackend(
                 network, funded_ordinals={0: 100_000}
             ),
@@ -607,6 +613,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         service = BitcoinToolWalletService(
             self.wallet_file,
             cache_file,
+            settings_store=self.settings_store,
             backend_factory=lambda network: FakeEsploraBackend(
                 network, funded_ordinals={0: 100_000}
             ),
@@ -669,6 +676,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         service = BitcoinToolWalletService(
             self.wallet_file,
             cache_file,
+            settings_store=self.settings_store,
             backend_factory=lambda network: FakeEsploraBackend(
                 network, funded_ordinals={0: 100_000}
             ),
@@ -725,6 +733,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         imported_service = BitcoinToolWalletService(
             data_directory / "retry-wallets.json",
             data_directory / "retry-cache.json",
+            settings_store=self.settings_store,
             backend_factory=lambda network: OfflineDiscoveryBackend(network),
         )
 
@@ -739,6 +748,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         retry_service = BitcoinToolWalletService(
             data_directory / "retry-wallets.json",
             data_directory / "retry-cache.json",
+            settings_store=self.settings_store,
             backend_factory=lambda network: FakeEsploraBackend(network),
         )
         retried = retry_service.import_wallet("RetryWallet", "password", words)
@@ -750,6 +760,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         service = BitcoinToolWalletService(
             wallet_file,
             data_directory / "send-cache-testnet4.json",
+            settings_store=self.settings_store,
             network=NETWORK_TESTNET4,
             backend_factory=lambda network: FakeEsploraBackend(
                 network, funded_ordinals={0: 50_000}
@@ -781,6 +792,7 @@ class BitcoinToolWalletServiceTests(TestCase):
         service = BitcoinToolWalletService(
             self.wallet_file,
             self.wallet_file.parent / "lifecycle-cache.json",
+            settings_store=self.settings_store,
             backend_factory=lambda _network: backend,
         )
         creation = service.create_wallet("Before", "old-password")

@@ -39,17 +39,15 @@ class BitcoinToolWalletService(WalletService):
         self,
         wallet_file: Path,
         cache_file: Path,
+        *,
+        settings_store: ApplicationSettingsStore,
         network: str = NETWORK_MAINNET,
         backend_factory: Callable[[str], object] | None = None,
-        settings_file: Path | None = None,
     ) -> None:
         self.wallet_file = Path(wallet_file)
         self.cache_file = Path(cache_file)
         self.network = network
-        self.settings = ApplicationSettingsStore(
-            settings_file or self.wallet_file.parent / "settings.json"
-        )
-        self.settings.ensure_exists()
+        self.settings_store = settings_store
         self.platform_wallet = PlatformWalletService(
             self.wallet_file,
             self.cache_file,
@@ -71,14 +69,14 @@ class BitcoinToolWalletService(WalletService):
     def _resolve_active_wallet(self) -> str | None:
         wallets = self.list_wallets()
         wallet_names = {wallet.name for wallet in wallets}
-        configured_name = self.settings.active_wallet(self.network)
+        configured_name = self.settings_store.active_wallet(self.network)
         selected_name = (
             configured_name
             if configured_name in wallet_names
             else wallets[0].name if wallets else None
         )
         if selected_name != configured_name:
-            self.settings.set_active_wallet(self.network, selected_name)
+            self.settings_store.set_active_wallet(self.network, selected_name)
         return selected_name
 
     def select_wallet(self, name: str) -> WalletSnapshot:
@@ -196,7 +194,7 @@ class BitcoinToolWalletService(WalletService):
             raise ValueError(str(exc)) from exc
         remaining = self.list_wallets()
         self._wallet_name = remaining[0].name if remaining else None
-        self.settings.set_active_wallet(self.network, self._wallet_name)
+        self.settings_store.set_active_wallet(self.network, self._wallet_name)
         return self.snapshot()
 
     def prepare_withdrawal(
@@ -269,7 +267,7 @@ class BitcoinToolWalletService(WalletService):
 
     def _activate_wallet(self, name: str) -> None:
         self._wallet_name = name
-        self.settings.set_active_wallet(self.network, name)
+        self.settings_store.set_active_wallet(self.network, name)
 
     def _require_active_wallet(self) -> str:
         if self._wallet_name is None:

@@ -105,6 +105,7 @@ def _start_import_scan(
 ) -> None:
     """Import and scan without blocking Tkinter's event loop."""
 
+    previous_grab = parent.grab_current()
     progress = tk.Toplevel(parent)
     progress.title("Import Wallet")
     apply_window_icon(progress)
@@ -151,6 +152,12 @@ def _start_import_scan(
         indicator.stop()
         progress.grab_release()
         progress.destroy()
+        if previous_grab is not None:
+            try:
+                if previous_grab.winfo_exists():
+                    previous_grab.grab_set()
+            except tk.TclError:
+                pass
         if error_message is not None:
             messagebox.showerror("Import Wallet", error_message, parent=parent)
             return
