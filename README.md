@@ -33,6 +33,14 @@ Product choices stay in the UI layer. For example, Platform transaction DTOs
 contain `network` and `txid`; `explorer_links.py` turns them into the chosen
 mempool.space URL.
 
+`wallets.json` is authoritative for wallet identity, names, keys, and address
+lifecycle. `wallet_cache.json` is non-authoritative and rebuildable: stale cache
+entries can never create or restore a wallet, or override authoritative wallet
+identity. It may also contain transient payment reservations and pending
+summaries, so Platform maintenance isolates the affected entry instead of
+discarding unrelated wallet state. Product code must not parse or mutate either
+file directly.
+
 ## Wallet setup behavior
 
 - Without a wallet, Home shows zero balance and no history; Deposit hides its
@@ -104,6 +112,26 @@ python build_testnet4.py
 The outputs are `dist/mini_bitcoin_wallet.exe` and `dist/mini_bitcoin_wallet_testnet4.exe`. Packaged wallets and
 caches are stored beside the executable, keeping mainnet and Testnet4 isolated.
 
+## Update the vendored Platform
+
+The `btc/`, `network/`, `wallet/`, and `tx/` directories are copied from the
+bitcoin-tool commit pinned in `tools/platform_upstream.json`. Update them only
+with the local synchronization tool; it cannot overwrite product-owned
+directories.
+
+```bash
+# 1. Complete and test the bitcoin-tool change, then commit it.
+# 2. Check out the intended bitcoin-tool branch/commit.
+python tools/sync_bitcoin_tool_platform.py --source ../bitcoin-tool
+python tools/sync_bitcoin_tool_platform.py --source ../bitcoin-tool --check
+python -m pytest -q
+```
+
+Commit the four vendored directories and `tools/platform_upstream.json`
+together. The tool rejects uncommitted changes inside the upstream Platform
+directories so the recorded commit always reproduces the copied source.
+Changes elsewhere in the upstream checkout do not block synchronization.
+
 ## Structure
 
 ```text
@@ -125,6 +153,9 @@ mini-bitcoin-wallet/
 ├── wallet_manager.py
 ├── wallet_settings_dialog.py
 ├── tests/
+├── tools/
+│   ├── platform_upstream.json
+│   └── sync_bitcoin_tool_platform.py
 ├── requirements.txt
 └── README.md
 ```

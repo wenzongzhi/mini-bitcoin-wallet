@@ -9,9 +9,9 @@ import tkinter as tk
 from wallet_core import (
     BitcoinAmount,
     DisplayUnit,
-    SendPreview,
     WalletApplication,
     WalletCreation,
+    WalletSnapshot,
     WalletSummary,
     WithdrawalDraft,
     WithdrawalReview,
@@ -88,6 +88,10 @@ class WalletUIState:
 
     def rename_wallet(self, name: str, password: str | None = None) -> None:
         self._apply_snapshot(self.application.rename_wallet(name, password))
+        # The active identity changed.  Refresh scheduling belongs to the
+        # product layer, so request a normal background synchronization that
+        # also rebuilds any cache entry the Platform had to ignore.
+        self._announce("<<ActiveWalletChanged>>")
 
     def change_password(
         self,
@@ -105,10 +109,8 @@ class WalletUIState:
         self._apply_snapshot(self.application.remove_wallet(password))
         self._announce("<<ActiveWalletChanged>>")
 
-    def create_wallet(
-        self, name: str, password: str, mnemonic: str | None = None
-    ) -> WalletCreation:
-        creation = self.application.create_wallet(name, password, mnemonic)
+    def create_wallet(self, name: str, password: str) -> WalletCreation:
+        creation = self.application.create_wallet(name, password)
         self._apply_snapshot(creation.snapshot)
         self._announce("<<ActiveWalletChanged>>")
         return creation
@@ -121,14 +123,14 @@ class WalletUIState:
         self._apply_snapshot(snapshot)
         self._announce("<<ActiveWalletChanged>>")
 
-    def apply_wallet_creation(self, creation: WalletCreation) -> None:
-        """Apply a wallet created by a background application use case."""
+    def apply_wallet_import(self, snapshot: WalletSnapshot) -> None:
+        """Apply an imported wallet after its background worker completes."""
 
-        self._apply_snapshot(creation.snapshot)
+        self._apply_snapshot(snapshot)
         self._announce("<<ActiveWalletChanged>>")
 
     def reload_wallet(self) -> None:
-        """Reload persistent state after a partially completed operation."""
+        """Reload the active wallet from the Platform-backed adapter."""
 
         self._apply_snapshot(self.application.load_wallet())
 
@@ -162,20 +164,11 @@ class WalletUIState:
             return True
         try:
             # Parsing here gives immediate feedback. The use case repeats the
-            # check at its own trust boundary before creating a preview.
+            # check at its own trust boundary before preparing a transaction.
             BitcoinAmount.parse(self.amount.get(), self.unit)
             return True
         except ValueError:
             return False
-
-    def preview_send(self, fee_rate_sat_vb: int) -> SendPreview:
-        return self.application.preview_send(
-            self.address.get(),
-            self.amount.get(),
-            self.unit,
-            fee_rate_sat_vb,
-            send_all=self.send_all.get(),
-        )
 
     def prepare_withdrawal(self, fee_rate_sat_vb: int) -> WithdrawalDraft:
         return self.application.prepare_withdrawal(

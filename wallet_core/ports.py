@@ -7,7 +7,6 @@ from abc import ABC, abstractmethod
 from .models import (
     BitcoinAmount,
     BroadcastResult,
-    SendPreview,
     TransactionStatus,
     WalletCreation,
     WalletSnapshot,
@@ -67,21 +66,17 @@ class WalletService(ABC):
         """Remove the active wallet and return the next active snapshot."""
 
     @abstractmethod
-    def create_wallet(
-        self, name: str, password: str, mnemonic: str | None = None
-    ) -> WalletCreation:
-        """Create a generated or imported encrypted wallet."""
+    def create_wallet(self, name: str, password: str) -> WalletCreation:
+        """Create a wallet and return its newly generated recovery words."""
 
     @abstractmethod
-    def preview_send(
+    def import_wallet(
         self,
-        destination: str,
-        amount: BitcoinAmount | None,
-        fee_rate_sat_vb: int,
-        *,
-        send_all: bool = False,
-    ) -> SendPreview:
-        """Validate and fund a transfer without signing or broadcasting it."""
+        name: str,
+        password: str,
+        mnemonic: str,
+    ) -> WalletCreation:
+        """Import a wallet without returning the caller-provided recovery words."""
 
     @abstractmethod
     def prepare_withdrawal(

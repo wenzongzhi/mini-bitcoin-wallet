@@ -6,7 +6,6 @@ from .models import (
     BitcoinAmount,
     BroadcastResult,
     DisplayUnit,
-    SendPreview,
     TransactionStatus,
     WalletCreation,
     WalletSnapshot,
@@ -72,41 +71,42 @@ class WalletApplication:
     def remove_wallet(self, password: str | None) -> WalletSnapshot:
         return self._service.remove_wallet(password)
 
-    def create_wallet(
-        self, name: str, password: str, mnemonic: str | None = None
+    def create_wallet(self, name: str, password: str) -> WalletCreation:
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("Wallet name cannot be empty.")
+        if not password:
+            raise ValueError("Password cannot be empty.")
+        result = self._service.create_wallet(normalized_name, password)
+        if not result.generated_mnemonic:
+            raise ValueError("Wallet creation did not return generated recovery words.")
+        return result
+
+    def import_wallet(
+        self,
+        name: str,
+        password: str,
+        mnemonic: str,
     ) -> WalletCreation:
         normalized_name = name.strip()
         if not normalized_name:
             raise ValueError("Wallet name cannot be empty.")
         if not password:
             raise ValueError("Password cannot be empty.")
-        normalized_mnemonic = " ".join(mnemonic.strip().split()) if mnemonic else None
-        return self._service.create_wallet(
+        normalized_mnemonic = " ".join(mnemonic.strip().split())
+        if not normalized_mnemonic:
+            raise ValueError("Recovery words cannot be empty.")
+        result = self._service.import_wallet(
             normalized_name,
             password,
             normalized_mnemonic,
         )
-
-    def preview_send(
-        self,
-        destination: str,
-        amount_text: str,
-        unit: DisplayUnit,
-        fee_rate_sat_vb: int,
-        *,
-        send_all: bool = False,
-    ) -> SendPreview:
-        normalized_destination = destination.strip()
-        if not normalized_destination:
-            raise ValueError("Enter a destination address.")
-        if isinstance(fee_rate_sat_vb, bool) or not 1 <= fee_rate_sat_vb <= 100:
-            raise ValueError("Fee rate must be between 1 and 100 sat/vB.")
-        amount = None if send_all else BitcoinAmount.parse(amount_text, unit)
-        return self._service.preview_send(
-            normalized_destination,
-            amount,
-            fee_rate_sat_vb,
-            send_all=send_all,
+        # Enforce the product boundary even if a custom adapter violates the
+        # port contract: caller-provided recovery words stop at import.
+        return WalletCreation(
+            snapshot=result.snapshot,
+            generated_mnemonic=None,
+            discovery=result.discovery,
         )
 
     def prepare_withdrawal(

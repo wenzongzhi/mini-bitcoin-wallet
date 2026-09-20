@@ -13,6 +13,7 @@ from pathlib import Path
 import secrets
 from threading import RLock
 from typing import Callable
+import warnings
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -57,6 +58,18 @@ from .wallet_sync import sync_wallet as synchronize_wallet_record
 
 GAP_LIMIT = 20
 DEFAULT_DISCOVERY_MAX_ADDRESSES = 10_000
+
+
+class WalletImportError(WalletError):
+    """A wallet import failed and the new wallet was rolled back."""
+
+
+class WalletImportCleanupError(WalletImportError):
+    """A wallet import failed and its rollback may be incomplete."""
+
+
+class WalletCacheWarning(RuntimeWarning):
+    """An authoritative wallet mutation succeeded but cache maintenance failed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,8 +117,7 @@ class WalletState:
 @dataclass(frozen=True, slots=True)
 class WalletCreationResult:
     state: WalletState
-    mnemonic: str
-    imported: bool
+    generated_mnemonic: str | None
     discovery: WalletDiscovery | None = None
 
 
@@ -189,34 +201,8 @@ class WalletService:
     def create_wallet(self, name: str, password: str | None) -> WalletCreationResult:
         """Create a generated wallet and issue its first receive address."""
 
-        mnemonic = mnemonic_from_entropy_hex(secrets.token_hex(32))
-        return self._create(name, password, mnemonic, imported=False)
-
-    def import_wallet(
-        self,
-        name: str,
-        password: str | None,
-        mnemonic: str,
-    ) -> WalletCreationResult:
-        """Create a wallet from mnemonic and scan receive/change discovery pools."""
-
-        return self._create(
-            name,
-            password,
-            normalize_mnemonic(mnemonic),
-            imported=True,
-        )
-
-    def _create(
-        self,
-        name: str,
-        password: str | None,
-        mnemonic: str,
-        *,
-        imported: bool,
-    ) -> WalletCreationResult:
         with self.operation_lock:
-            discovery = None
+            mnemonic = mnemonic_from_entropy_hex(secrets.token_hex(32))
             create_wallet_record(
                 name,
                 password=password,
@@ -224,18 +210,66 @@ class WalletService:
                 wallet_file=self.wallet_file,
                 network=self.network,
             )
-            if imported:
+            cache_usable = self._maintain_cache(
+                lambda: self._remove_cache_entry(name),
+                f'created wallet "{name}" but could not clear stale cache data',
+            )
+            get_new_address(
+                name,
+                wallet_file=self.wallet_file,
+                address_type=self.address_type,
+                network=self.network,
+            )
+            state = self._state_after_cache_maintenance(
+                name,
+                cache_usable,
+                f'wallet "{name}" was created but its cache state is invalid',
+            )
+            return WalletCreationResult(state, mnemonic)
+
+    def import_wallet(
+        self,
+        name: str,
+        password: str | None,
+        mnemonic: str,
+    ) -> WalletCreationResult:
+        """Import, discover, and sync with rollback on caught failures."""
+
+        normalized_mnemonic = normalize_mnemonic(mnemonic)
+        _validate_mnemonic(normalized_mnemonic)
+        with self.operation_lock:
+            record_created = False
+            create_wallet_record(
+                name,
+                password=password,
+                mnemonic=normalized_mnemonic,
+                wallet_file=self.wallet_file,
+                network=self.network,
+            )
+            record_created = True
+            try:
+                self._remove_cache_entry(name)
                 discovery = self._discover_imported_wallet(name)
                 state = self.sync_wallet(name)
-            else:
-                get_new_address(
-                    name,
-                    wallet_file=self.wallet_file,
-                    address_type=self.address_type,
-                    network=self.network,
+            except Exception as import_error:
+                safe_error = _redact_recovery_words(
+                    str(import_error),
+                    mnemonic,
+                    normalized_mnemonic,
                 )
-                state = self.get_wallet_state(name)
-            return WalletCreationResult(state, mnemonic, imported, discovery)
+                if record_created:
+                    cleanup_failures = self._rollback_import(name)
+                    if cleanup_failures:
+                        failed_targets = " and ".join(cleanup_failures)
+                        raise WalletImportCleanupError(
+                            f'wallet "{name}" import failed and cleanup may be '
+                            f'incomplete for {failed_targets}'
+                        ) from None
+                raise WalletImportError(
+                    f'wallet "{name}" import failed and was rolled back: '
+                    f'{safe_error}'
+                ) from None
+            return WalletCreationResult(state, None, discovery)
 
     def _discover_imported_wallet(self, name: str) -> WalletDiscovery:
         """Discover address history cheaply, then persist both branches once."""
@@ -313,36 +347,39 @@ class WalletService:
         metadata = self._metadata(name)
         receive_address = self.get_receive_address(name)
         if not self.cache_file.exists():
-            return WalletState(metadata, 0, 0, 0, 0, 0, 0, receive_address, (), None, ())
+            return self._empty_wallet_state(metadata, receive_address)
         with locked_cache_file(self.cache_file):
             cache = load_wallet_cache(self.cache_file)
             wallet_cache = cache.get("wallets", {}).get(name)
-            if not isinstance(wallet_cache, dict):
-                return WalletState(metadata, 0, 0, 0, 0, 0, 0, receive_address, (), None, ())
-            balance = calculate_wallet_balance(wallet_cache)
-            transaction_values = wallet_cache.get("transactions", [])
-            if not isinstance(transaction_values, list):
-                raise WalletError("wallet cache transaction list is invalid")
-            transactions = tuple(
-                transaction
-                for transaction in (
-                    transaction_from_cache(value) for value in transaction_values
-                )
-                if transaction is not None
+        if not isinstance(wallet_cache, dict) or not self._cache_entry_matches_wallet(
+            name,
+            wallet_cache,
+        ):
+            return self._empty_wallet_state(metadata, receive_address)
+        balance = calculate_wallet_balance(wallet_cache)
+        transaction_values = wallet_cache.get("transactions", [])
+        if not isinstance(transaction_values, list):
+            raise WalletError("wallet cache transaction list is invalid")
+        transactions = tuple(
+            transaction
+            for transaction in (
+                transaction_from_cache(value) for value in transaction_values
             )
-            pending = wallet_cache.get("pending_transactions", [])
-            pending_txids = (
-                tuple(
-                    item["txid"]
-                    for item in pending
-                    if isinstance(item, dict)
-                    and isinstance(item.get("txid"), str)
-                    and len(item["txid"]) == 64
-                )
-                if isinstance(pending, list)
-                else ()
+            if transaction is not None
+        )
+        pending = wallet_cache.get("pending_transactions", [])
+        pending_txids = (
+            tuple(
+                item["txid"]
+                for item in pending
+                if isinstance(item, dict)
+                and isinstance(item.get("txid"), str)
+                and len(item["txid"]) == 64
             )
-            synced_at = _parse_timestamp(wallet_cache.get("synced_at"))
+            if isinstance(pending, list)
+            else ()
+        )
+        synced_at = _parse_timestamp(wallet_cache.get("synced_at"))
         return WalletState(
             metadata,
             balance.authoritative_sats,
@@ -377,7 +414,7 @@ class WalletService:
                 address_type=self.address_type,
                 network=self.network,
             )["address"]
-        target_index = self._next_receive_index(name)
+        target_index = self._next_receive_index(receive_entries)
         matching = next(
             (entry for entry in receive_entries if entry.get("index") == target_index),
             None,
@@ -407,6 +444,7 @@ class WalletService:
 
         self._metadata(name)
         with self.operation_lock:
+            self._discard_stale_cache_entry(name)
             cached_history = (
                 None if include_transactions else self._read_cached_history(name)
             )
@@ -436,11 +474,12 @@ class WalletService:
         new_name: str,
         password: str | None,
     ) -> WalletState:
-        """Rename metadata, encryption AAD, and the matching cache entry."""
+        """Rename authoritative wallet data, then best-effort migrate its cache."""
 
         _validate_wallet_name(new_name)
+        if new_name == name:
+            return self.get_wallet_state(name)
         with self.operation_lock:
-            self._ensure_cache_name_available(new_name)
             with _locked_wallet_file(self.wallet_file):
                 wallets = _load_wallets(self.wallet_file)
                 wallet = wallets.get(name)
@@ -458,8 +497,16 @@ class WalletService:
                 wallets.pop(name)
                 wallets[new_name] = renamed
                 _save_wallets(wallets, self.wallet_file)
-            self._rename_cache_entry(name, new_name)
-        return self.get_wallet_state(new_name)
+            cache_usable = self._maintain_cache(
+                lambda: self._rename_cache_entry(name, new_name),
+                f'wallet "{name}" was renamed to "{new_name}" but its cache '
+                "could not be migrated",
+            )
+        return self._state_after_cache_maintenance(
+            new_name,
+            cache_usable,
+            f'wallet "{new_name}" was renamed but its cache state is invalid',
+        )
 
     def change_password(
         self,
@@ -494,19 +541,23 @@ class WalletService:
         return self.get_wallet_state(name)
 
     def remove_wallet(self, name: str, password: str | None) -> None:
-        """Verify ownership, remove the wallet, and remove only its cache entry."""
+        """Remove authoritative wallet data, then best-effort discard its cache."""
 
-        with self.operation_lock, _locked_wallet_file(self.wallet_file):
-            wallets = _load_wallets(self.wallet_file)
-            wallet = wallets.get(name)
-            if not isinstance(wallet, dict):
-                raise WalletError(f'wallet "{name}" does not exist')
-            _require_current_wallet(wallet, self.network)
-            if wallet.get("encrypted") is True:
-                _read_mnemonic(name, wallet, password, self.network)
-            wallets.pop(name)
-            _save_wallets(wallets, self.wallet_file)
-        self._remove_cache_entry(name)
+        with self.operation_lock:
+            with _locked_wallet_file(self.wallet_file):
+                wallets = _load_wallets(self.wallet_file)
+                wallet = wallets.get(name)
+                if not isinstance(wallet, dict):
+                    raise WalletError(f'wallet "{name}" does not exist')
+                _require_current_wallet(wallet, self.network)
+                if wallet.get("encrypted") is True:
+                    _read_mnemonic(name, wallet, password, self.network)
+                wallets.pop(name)
+                _save_wallets(wallets, self.wallet_file)
+            self._maintain_cache(
+                lambda: self._remove_cache_entry(name),
+                f'wallet "{name}" was removed but its cache could not be cleaned',
+            )
 
     def transaction_status(self, txid: str) -> TransactionStatus:
         """Query one transaction without scanning wallet addresses."""
@@ -536,21 +587,14 @@ class WalletService:
             raise WalletError(f'wallet "{name}" does not exist on {self.network}')
         return match
 
-    def _next_receive_index(self, name: str) -> int:
-        if not self.cache_file.exists():
-            return 0
-        with locked_cache_file(self.cache_file):
-            cache = load_wallet_cache(self.cache_file)
-            wallet_cache = cache.get("wallets", {}).get(name)
-            if not isinstance(wallet_cache, dict):
-                return 0
-            addresses = wallet_cache.get("addresses", [])
+    @staticmethod
+    def _next_receive_index(receive_entries: list[dict]) -> int:
+        """Derive the next receive index from authoritative address metadata."""
+
         used_indexes = [
             entry.get("index")
-            for entry in addresses
+            for entry in receive_entries
             if isinstance(entry, dict)
-            and entry.get("branch") == 0
-            and str(entry.get("address_type", "")).lower() == self.address_type
             and entry.get("used") is True
             and isinstance(entry.get("index"), int)
         ]
@@ -593,21 +637,13 @@ class WalletService:
         with locked_cache_file(self.cache_file):
             cache = load_wallet_cache(self.cache_file)
             wallets = cache["wallets"]
-            if new_name in wallets:
-                raise WalletError(f'wallet cache for "{new_name}" already exists')
             entry = wallets.pop(name, None)
+            stale_entry = wallets.pop(new_name, None)
             if isinstance(entry, dict):
                 entry["wallet_name"] = new_name
                 wallets[new_name] = entry
+            if isinstance(entry, dict) or stale_entry is not None:
                 save_wallet_cache(cache, self.cache_file)
-
-    def _ensure_cache_name_available(self, new_name: str) -> None:
-        if not self.cache_file.exists():
-            return
-        with locked_cache_file(self.cache_file):
-            cache = load_wallet_cache(self.cache_file)
-            if new_name in cache["wallets"]:
-                raise WalletError(f'wallet cache for "{new_name}" already exists')
 
     def _remove_cache_entry(self, name: str) -> None:
         if not self.cache_file.exists():
@@ -616,6 +652,164 @@ class WalletService:
             cache = load_wallet_cache(self.cache_file)
             if cache["wallets"].pop(name, None) is not None:
                 save_wallet_cache(cache, self.cache_file)
+
+    def _discard_stale_cache_entry(self, name: str) -> None:
+        """Drop same-name cache state that belongs to another wallet identity."""
+
+        if not self.cache_file.exists():
+            return
+        authoritative = self._authoritative_address_identity(name)
+        with locked_cache_file(self.cache_file):
+            cache = load_wallet_cache(self.cache_file)
+            wallet_cache = cache.get("wallets", {}).get(name)
+            if not isinstance(wallet_cache, dict):
+                return
+            if self._cache_entry_matches_addresses(
+                wallet_cache,
+                authoritative,
+                expected_name=name,
+            ):
+                return
+            cache["wallets"].pop(name, None)
+            save_wallet_cache(cache, self.cache_file)
+
+    def _rollback_import(self, name: str) -> tuple[str, ...]:
+        """Remove every persistent artifact created by a failed import."""
+
+        failed_targets = []
+        try:
+            with _locked_wallet_file(self.wallet_file):
+                wallets = _load_wallets(self.wallet_file)
+                if wallets.pop(name, None) is not None:
+                    _save_wallets(wallets, self.wallet_file)
+        except Exception:
+            failed_targets.append("authoritative wallet data")
+
+        try:
+            self._remove_cache_entry(name)
+        except Exception:
+            failed_targets.append("wallet cache data")
+        return tuple(failed_targets)
+
+    def _maintain_cache(
+        self,
+        operation: Callable[[], None],
+        warning_message: str,
+    ) -> bool:
+        """Run cache maintenance without negating an authoritative mutation.
+
+        Returning ``False`` tells callers not to use the affected entry.  The
+        complete cache is intentionally preserved because other wallets may
+        have active payment reservations or pending transaction summaries.
+        """
+
+        try:
+            operation()
+            return True
+        except Exception as cache_error:
+            warnings.warn(
+                f"{warning_message}; stale cache data will be ignored until "
+                f"the next successful synchronization: {cache_error}",
+                WalletCacheWarning,
+                stacklevel=2,
+            )
+            return False
+
+    def _state_without_cache(self, name: str) -> WalletState:
+        """Return authoritative identity/address state without reading cache."""
+
+        metadata = self._metadata(name)
+        receive_address = self.get_receive_address(name)
+        return self._empty_wallet_state(metadata, receive_address)
+
+    def _state_after_cache_maintenance(
+        self,
+        name: str,
+        cache_usable: bool,
+        warning_message: str,
+    ) -> WalletState:
+        """Return lifecycle success even when its derived cache is unusable."""
+
+        if cache_usable:
+            try:
+                return self.get_wallet_state(name)
+            except WalletError as cache_error:
+                warnings.warn(
+                    f"{warning_message}; it will be rebuilt by synchronization: "
+                    f"{cache_error}",
+                    WalletCacheWarning,
+                    stacklevel=2,
+                )
+        return self._state_without_cache(name)
+
+    @staticmethod
+    def _empty_wallet_state(
+        metadata: WalletMetadata,
+        receive_address: str,
+    ) -> WalletState:
+        return WalletState(
+            metadata,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            receive_address,
+            (),
+            None,
+            (),
+        )
+
+    def _cache_entry_matches_wallet(self, name: str, wallet_cache: dict) -> bool:
+        """Reject cache entries that belong to an older wallet with this name."""
+
+        return self._cache_entry_matches_addresses(
+            wallet_cache,
+            self._authoritative_address_identity(name),
+            expected_name=name,
+        )
+
+    def _authoritative_address_identity(self, name: str) -> dict[str, dict]:
+        """Index the stable address fields that identify one deterministic wallet."""
+
+        address_book = get_wallet_address_book(
+            name,
+            wallet_file=self.wallet_file,
+            address_type=self.address_type,
+            network=self.network,
+        )
+        return {
+            entry.get("address"): entry
+            for entry in address_book["addresses"]
+            if isinstance(entry, dict) and isinstance(entry.get("address"), str)
+        }
+
+    @staticmethod
+    def _cache_entry_matches_addresses(
+        wallet_cache: dict,
+        authoritative: dict[str, dict],
+        *,
+        expected_name: str,
+    ) -> bool:
+        """Return whether a cache entry is a subset of one wallet address book."""
+
+        if wallet_cache.get("wallet_name") != expected_name:
+            return False
+        cached_addresses = wallet_cache.get("addresses")
+        if not isinstance(cached_addresses, list) or not cached_addresses:
+            return False
+        for cached in cached_addresses:
+            if not isinstance(cached, dict):
+                return False
+            address = cached.get("address")
+            stored = authoritative.get(address)
+            if stored is None or any(
+                cached.get(field) != stored.get(field)
+                for field in ("branch", "index", "account_id", "address_type")
+            ):
+                return False
+        return True
 
 
 def _encrypt_mnemonic(name: str, mnemonic: str, password: str | None) -> dict:
@@ -649,6 +843,21 @@ def _parse_timestamp(value) -> datetime | None:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(timezone.utc)
+
+
+def _redact_recovery_words(message: str, *secret_values: str) -> str:
+    """Remove caller-provided recovery words from a surfaced error message."""
+
+    safe_message = message or "wallet import failed"
+    secrets_to_redact = {
+        secret
+        for value in secret_values
+        for secret in (value, " ".join(value.split()))
+        if secret
+    }
+    for secret in sorted(secrets_to_redact, key=len, reverse=True):
+        safe_message = safe_message.replace(secret, "[recovery words redacted]")
+    return safe_message
 
 
 def _address_stats_have_history(address_data: object) -> bool:

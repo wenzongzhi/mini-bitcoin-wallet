@@ -121,22 +121,16 @@ class WalletSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class WalletCreation:
+    """Result shared by wallet creation and import use cases.
+
+    Only ``create_wallet`` may populate ``generated_mnemonic``.  Imported
+    recovery words are caller-owned input and must not travel back through the
+    product layer after the Platform has consumed them.
+    """
+
     snapshot: WalletSnapshot
-    mnemonic: str
-    imported: bool
+    generated_mnemonic: str | None
     discovery: AddressDiscoverySummary | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class SendPreview:
-    destination: str
-    amount: BitcoinAmount
-    fee: BitcoinAmount
-    fee_rate_sat_vb: int
-
-    @property
-    def total(self) -> BitcoinAmount:
-        return BitcoinAmount(self.amount.sats + self.fee.sats)
 
 
 @dataclass(frozen=True, slots=True)

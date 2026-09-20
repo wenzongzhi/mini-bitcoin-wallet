@@ -11,6 +11,7 @@ from tx.service import PaymentService as PlatformPaymentService
 from tx.service import TransactionError
 from wallet.service import AccountedTransaction
 from wallet.service import TransactionStatus as PlatformTransactionStatus
+from wallet.service import WalletCreationResult as PlatformWalletCreationResult
 from wallet.service import WalletError
 from wallet.service import WalletMetadata as PlatformWalletMetadata
 from wallet.service import WalletService as PlatformWalletService
@@ -19,7 +20,6 @@ from wallet_core.models import (
     AddressDiscoverySummary,
     BitcoinAmount,
     BroadcastResult,
-    SendPreview,
     TransactionDirection,
     TransactionStatus,
     TransactionSummary,
@@ -123,57 +123,34 @@ class BitcoinToolWalletService(WalletService):
         except WalletError as exc:
             raise ValueError(str(exc)) from exc
 
-    def create_wallet(
+    def create_wallet(self, name: str, password: str) -> WalletCreation:
+        try:
+            result = self.platform_wallet.create_wallet(name, password)
+        except WalletError as exc:
+            raise ValueError(str(exc)) from exc
+        if result.generated_mnemonic is None:
+            raise ValueError("The Platform did not return generated recovery words.")
+        self._activate_wallet(name)
+        return self._creation_result(
+            result,
+            generated_mnemonic=result.generated_mnemonic,
+        )
+
+    def import_wallet(
         self,
         name: str,
         password: str,
-        mnemonic: str | None = None,
+        mnemonic: str,
     ) -> WalletCreation:
-        imported = mnemonic is not None
-        existed_before_import = imported and self._platform_wallet_exists(name)
         try:
-            creation = (
-                self.platform_wallet.import_wallet(name, password, mnemonic)
-                if mnemonic is not None
-                else self.platform_wallet.create_wallet(name, password)
-            )
+            result = self.platform_wallet.import_wallet(name, password, mnemonic)
         except WalletError as exc:
-            if (
-                imported
-                and not existed_before_import
-                and self._platform_wallet_exists(name)
-            ):
-                try:
-                    # Discovery is part of import. Roll back the new record so
-                    # a temporary backend failure can be retried with the same
-                    # wallet name and mnemonic instead of leaving an address
-                    # book that looks initialized but is incomplete.
-                    self.platform_wallet.remove_wallet(name, password)
-                except WalletError as cleanup_error:
-                    raise ValueError(
-                        "Wallet import and automatic cleanup both failed. "
-                        f"Import error: {exc}. Cleanup error: {cleanup_error}"
-                    ) from cleanup_error
-                raise ValueError(
-                    "Wallet import was not saved because address discovery "
-                    f"could not complete: {exc}"
-                ) from exc
             raise ValueError(str(exc)) from exc
         self._activate_wallet(name)
-        discovery = None
-        if creation.discovery is not None:
-            discovery = AddressDiscoverySummary(
-                receive_scanned=creation.discovery.receive.scanned_count,
-                change_scanned=creation.discovery.change.scanned_count,
-                receive_used=len(creation.discovery.receive.used_indexes),
-                change_used=len(creation.discovery.change.used_indexes),
-            )
-        return WalletCreation(
-            self._wallet_snapshot(creation.state),
-            creation.mnemonic,
-            creation.imported,
-            discovery,
-        )
+        # Imported recovery words are caller-owned input.  Never propagate
+        # them into product DTOs, even if a future Platform implementation
+        # accidentally populates the optional field.
+        return self._creation_result(result, generated_mnemonic=None)
 
     def get_mnemonic(self, password: str | None) -> str:
         wallet_name = self._require_active_wallet()
@@ -221,16 +198,6 @@ class BitcoinToolWalletService(WalletService):
         self._wallet_name = remaining[0].name if remaining else None
         self.settings.set_active_wallet(self.network, self._wallet_name)
         return self.snapshot()
-
-    def preview_send(
-        self,
-        destination: str,
-        amount: BitcoinAmount | None,
-        fee_rate_sat_vb: int,
-        *,
-        send_all: bool = False,
-    ) -> SendPreview:
-        raise ValueError("Use prepare withdrawal for an exact funded preview.")
 
     def prepare_withdrawal(
         self,
@@ -309,13 +276,25 @@ class BitcoinToolWalletService(WalletService):
             raise ValueError("Create or import a wallet before continuing.")
         return self._wallet_name
 
-    def _platform_wallet_exists(self, name: str) -> bool:
-        try:
-            return name in {
-                wallet.name for wallet in self.platform_wallet.list_wallets()
-            }
-        except WalletError:
-            return False
+    def _creation_result(
+        self,
+        result: PlatformWalletCreationResult,
+        *,
+        generated_mnemonic: str | None,
+    ) -> WalletCreation:
+        discovery = None
+        if result.discovery is not None:
+            discovery = AddressDiscoverySummary(
+                receive_scanned=result.discovery.receive.scanned_count,
+                change_scanned=result.discovery.change.scanned_count,
+                receive_used=len(result.discovery.receive.used_indexes),
+                change_used=len(result.discovery.change.used_indexes),
+            )
+        return WalletCreation(
+            snapshot=self._wallet_snapshot(result.state),
+            generated_mnemonic=generated_mnemonic,
+            discovery=discovery,
+        )
 
     def _wallet_snapshot(self, state: PlatformWalletState) -> WalletSnapshot:
         return WalletSnapshot(

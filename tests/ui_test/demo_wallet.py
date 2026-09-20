@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from wallet_core.models import (
     BitcoinAmount,
     BroadcastResult,
-    SendPreview,
     TransactionDirection,
     TransactionStatus,
     TransactionSummary,
@@ -118,23 +117,65 @@ class DemoWalletService(WalletService):
         )
         return self._snapshot
 
-    def create_wallet(
-        self, name: str, password: str, mnemonic: str | None = None
+    def create_wallet(self, name: str, password: str) -> WalletCreation:
+        self._snapshot = replace(self._snapshot, name=name, is_initialized=True)
+        return WalletCreation(self._snapshot, "demo mnemonic")
+
+    def import_wallet(
+        self,
+        name: str,
+        password: str,
+        mnemonic: str,
     ) -> WalletCreation:
         self._snapshot = replace(self._snapshot, name=name, is_initialized=True)
-        return WalletCreation(self._snapshot, mnemonic or "demo mnemonic", mnemonic is not None)
+        return WalletCreation(self._snapshot, generated_mnemonic=None)
 
-    def preview_send(
+    def prepare_withdrawal(
         self,
         destination: str,
         amount: BitcoinAmount | None,
         fee_rate_sat_vb: int,
         *,
         send_all: bool = False,
-    ) -> SendPreview:
-        # A real adapter delegates address validation and funding to bitcoin-tool.
+    ) -> WithdrawalDraft:
+        funded_amount, fee = self._fund_withdrawal(
+            destination,
+            amount,
+            fee_rate_sat_vb,
+            send_all=send_all,
+        )
+        self._demo_draft = (
+            destination,
+            funded_amount,
+            fee,
+            fee_rate_sat_vb,
+            send_all,
+        )
+        return WithdrawalDraft(
+            draft_id="demo-review",
+            wallet_name=self._snapshot.name,
+            network=self._snapshot.network,
+            destination=destination,
+            amount=funded_amount,
+            estimated_fee=fee,
+            fee_rate_sat_vb=fee_rate_sat_vb,
+            send_all=send_all,
+        )
+
+    def _fund_withdrawal(
+        self,
+        destination: str,
+        amount: BitcoinAmount | None,
+        fee_rate_sat_vb: int,
+        *,
+        send_all: bool,
+    ) -> tuple[BitcoinAmount, BitcoinAmount]:
+        """Provide deterministic funding for the UI-only prepare workflow."""
+
         if not destination.lower().startswith(("bc1", "1", "3")):
-            raise ValueError("The destination is not a supported mainnet Bitcoin address.")
+            raise ValueError(
+                "The destination is not a supported mainnet Bitcoin address."
+            )
         fee = BitcoinAmount(self.ESTIMATED_TRANSACTION_VBYTES * fee_rate_sat_vb)
         if send_all:
             spendable = self._snapshot.available_balance.sats - fee.sats
@@ -146,49 +187,23 @@ class DemoWalletService(WalletService):
             raise ValueError("The amount must be greater than zero.")
         if amount.sats + fee.sats > self._snapshot.available_balance.sats:
             raise ValueError("The amount and fee exceed the wallet balance.")
-        return SendPreview(destination, amount, fee, fee_rate_sat_vb)
-
-    def prepare_withdrawal(
-        self,
-        destination: str,
-        amount: BitcoinAmount | None,
-        fee_rate_sat_vb: int,
-        *,
-        send_all: bool = False,
-    ) -> WithdrawalDraft:
-        preview = self.preview_send(
-            destination,
-            amount,
-            fee_rate_sat_vb,
-            send_all=send_all,
-        )
-        self._demo_draft = (preview, send_all)
-        return WithdrawalDraft(
-            draft_id="demo-review",
-            wallet_name=self._snapshot.name,
-            network=self._snapshot.network,
-            destination=destination,
-            amount=preview.amount,
-            estimated_fee=preview.fee,
-            fee_rate_sat_vb=fee_rate_sat_vb,
-            send_all=send_all,
-        )
+        return amount, fee
 
     def sign_withdrawal(
         self, draft_id: str, password: str | None
     ) -> WithdrawalReview:
         if draft_id != "demo-review" or self._demo_draft is None:
             raise ValueError("Withdrawal draft does not exist.")
-        preview, send_all = self._demo_draft
+        destination, amount, fee, fee_rate_sat_vb, send_all = self._demo_draft
         return WithdrawalReview(
             review_id=draft_id,
             wallet_name=self._snapshot.name,
             network=self._snapshot.network,
             txid="0" * 64,
-            destination=preview.destination,
-            amount=preview.amount,
-            fee=preview.fee,
-            fee_rate_sat_vb=preview.fee_rate_sat_vb,
+            destination=destination,
+            amount=amount,
+            fee=fee,
+            fee_rate_sat_vb=fee_rate_sat_vb,
             send_all=send_all,
         )
 

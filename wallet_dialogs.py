@@ -11,6 +11,17 @@ from state import WalletUIState
 from app_assets import apply_window_icon
 
 
+def _import_error_message(error: Exception, mnemonic: str) -> str:
+    """Return a display-safe error without retaining recovery words/traceback."""
+
+    message = str(error) or "Wallet import failed."
+    normalized_mnemonic = " ".join(mnemonic.split())
+    for secret in {mnemonic, normalized_mnemonic}:
+        if secret:
+            message = message.replace(secret, "[recovery words redacted]")
+    return message
+
+
 def _ask_credentials(parent: tk.Misc, action: str) -> tuple[str, str] | None:
     name = simpledialog.askstring(
         action,
@@ -51,10 +62,18 @@ def create_new_wallet(parent: tk.Misc, state: WalletUIState) -> bool:
     except ValueError as exc:
         messagebox.showerror("Create Wallet", str(exc), parent=parent)
         return False
+    generated_mnemonic = creation.generated_mnemonic
+    if not generated_mnemonic:
+        messagebox.showerror(
+            "Create Wallet",
+            "The wallet was created without recovery words to display.",
+            parent=parent,
+        )
+        return False
     messagebox.showwarning(
         "Back Up Secret Words",
         "Write down these secret words in order and store them offline.\n\n"
-        f"{creation.mnemonic}\n\n"
+        f"{generated_mnemonic}\n\n"
         "They will not be shown again automatically.",
         parent=parent,
     )
@@ -110,14 +129,20 @@ def _start_import_scan(
 
     def run_import():
         try:
-            creation = state.application.create_wallet(name, password, mnemonic)
-            results.put((creation, None))
-        except Exception as exc:  # passed to the UI thread for presentation
-            results.put((None, exc))
+            result = state.application.import_wallet(name, password, mnemonic)
+            # Pass only non-secret presentation data across the worker queue.
+            # In particular, the user-provided recovery words never make the
+            # return trip back to Tk's UI thread.
+            results.put((result.snapshot, result.discovery, None))
+        except Exception as exc:
+            # Exception tracebacks retain worker-frame locals.  Queue only a
+            # redacted string so the mnemonic does not remain reachable from
+            # Tk's UI thread through ``exc.__traceback__``.
+            results.put((None, None, _import_error_message(exc, mnemonic)))
 
     def poll_result():
         try:
-            creation, error = results.get_nowait()
+            snapshot, discovery, error_message = results.get_nowait()
         except Empty:
             if progress.winfo_exists():
                 parent.after(100, poll_result)
@@ -126,19 +151,19 @@ def _start_import_scan(
         indicator.stop()
         progress.grab_release()
         progress.destroy()
-        if error is not None:
-            messagebox.showerror("Import Wallet", str(error), parent=parent)
+        if error_message is not None:
+            messagebox.showerror("Import Wallet", error_message, parent=parent)
             return
 
-        state.apply_wallet_creation(creation)
+        state.apply_wallet_import(snapshot)
         discovery_text = ""
-        if creation.discovery is not None:
+        if discovery is not None:
             discovery_text = (
                 "\n\n"
-                f"Receive: scanned {creation.discovery.receive_scanned}, "
-                f"found {creation.discovery.receive_used} used.\n"
-                f"Change: scanned {creation.discovery.change_scanned}, "
-                f"found {creation.discovery.change_used} used."
+                f"Receive: scanned {discovery.receive_scanned}, "
+                f"found {discovery.receive_used} used.\n"
+                f"Change: scanned {discovery.change_scanned}, "
+                f"found {discovery.change_used} used."
             )
         messagebox.showinfo(
             "Import Wallet",
