@@ -8,7 +8,7 @@ from app_settings import (
     SettingsError,
     create_backend_factory,
     default_settings,
-    detect_legacy_wallet_data_dir,
+    select_initial_wallet_data_dir,
 )
 from theme import Theme
 from state import WalletUIState
@@ -149,7 +149,7 @@ def run_wallet_app(
     """Build and run one network-specific wallet application."""
 
     try:
-        settings_store = create_settings_store(network=network)
+        settings_store = create_settings_store()
     except SettingsError as exc:
         _show_startup_error(str(exc))
         return
@@ -172,7 +172,6 @@ def run_wallet_app(
 
 def create_settings_store(
     *,
-    network: str,
     settings_path: str | Path | None = None,
     legacy_data_directory: str | Path | None = None,
 ) -> ApplicationSettingsStore:
@@ -188,11 +187,11 @@ def create_settings_store(
         store.load()
         return store
 
-    legacy_directory = detect_legacy_wallet_data_dir(
+    initial_wallet_directory = select_initial_wallet_data_dir(
+        store.path.parent,
         legacy_data_directory or legacy_wallet_data_directory(),
-        network,
     )
-    store.load_or_create(default_settings(legacy_directory))
+    store.load_or_create(default_settings(initial_wallet_directory))
     return store
 
 

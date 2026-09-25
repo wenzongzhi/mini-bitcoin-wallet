@@ -144,41 +144,66 @@ def default_application_settings_file() -> Path:
     return user_config_path(APPLICATION_NAME, appauthor=False) / "settings.json"
 
 
+def default_wallet_data_dir(
+    settings_file: str | os.PathLike[str] | None = None,
+) -> Path:
+    """Return the wallet directory beside the selected settings file."""
+
+    path = (
+        Path(settings_file)
+        if settings_file is not None
+        else default_application_settings_file()
+    )
+    return path.expanduser().resolve(strict=False).parent
+
+
 def default_settings(
     wallet_data_dir: str | os.PathLike[str] | None = None,
 ) -> ApplicationSettings:
-    """Return a fresh Version 2 settings snapshot."""
+    """Return a fresh Version 2 settings snapshot.
+
+    New installations keep wallet data beside the Mini Bitcoin Wallet settings
+    file.
+    """
+
+    selected_wallet_dir = wallet_data_dir
+    if selected_wallet_dir is None:
+        selected_wallet_dir = default_wallet_data_dir()
 
     return ApplicationSettings(
         version=SETTINGS_VERSION,
         active_wallets={network: None for network in SUPPORTED_NETWORKS},
         general=GeneralSettings(),
         network={network: BackendSettings() for network in SUPPORTED_NETWORKS},
-        storage=StorageSettings(wallet_data_dir),
+        storage=StorageSettings(selected_wallet_dir),
     )
 
 
-def detect_legacy_wallet_data_dir(
+def select_initial_wallet_data_dir(
+    application_data_dir: str | os.PathLike[str],
     legacy_data_dir: str | os.PathLike[str],
-    network: str,
-) -> Path | None:
-    """Locate this network's old mini-wallet data without touching it.
+) -> Path:
+    """Choose first-run storage without moving or reading wallet contents.
 
-    The corresponding Platform wallet wins when it exists. Otherwise the
-    legacy directory is selected only when it contains this network's standard
-    wallet filename. Wallet contents are never read, copied, moved, merged, or
-    deleted.
+    The application directory is the new default. Existing data wins in a
+    deterministic order: application default, bitcoin-tool default, then the
+    legacy source/EXE directory. Both supported networks are considered because
+    one application-wide directory stores all four wallet/cache files.
     """
 
-    _validate_network(network)
-    # Resolve through bitcoin-tool's public wallet package so its platformdirs
-    # and BITCOIN_TOOL_DATADIR policy remain the single source of truth.
-    if default_wallet_file(network=network).is_file():
-        return None
-
+    application_directory = (
+        Path(application_data_dir).expanduser().resolve(strict=False)
+    )
+    platform_directory = default_wallet_file(network=NETWORK_MAINNET).parent
     legacy_directory = Path(legacy_data_dir).expanduser().resolve(strict=False)
-    legacy_wallet = default_wallet_file(legacy_directory, network)
-    return legacy_directory if legacy_wallet.is_file() else None
+    for candidate in (
+        application_directory,
+        platform_directory,
+        legacy_directory,
+    ):
+        if _contains_standard_wallet(candidate):
+            return candidate
+    return application_directory
 
 
 def wallet_data_dir_from_selected_file(
@@ -251,7 +276,7 @@ class ApplicationSettingsStore:
         with self._locked():
             if self.path.exists():
                 return self._read_unlocked()
-            settings = initial or default_settings()
+            settings = initial or default_settings(self.path.parent)
             self._write_unlocked(settings)
             return settings
 
@@ -337,7 +362,7 @@ class ApplicationSettingsStore:
             with self.path.open("r", encoding="utf-8") as file:
                 document = json.load(file)
         except FileNotFoundError:
-            return default_settings()
+            return default_settings(self.path.parent)
         except (OSError, json.JSONDecodeError) as exc:
             raise SettingsError("Cannot read application settings.") from exc
         return _decode_settings(document)
@@ -382,6 +407,13 @@ class ApplicationSettingsStore:
             raise SettingsError("Application settings are busy.") from exc
         except OSError as exc:
             raise SettingsError("Cannot lock application settings.") from exc
+
+
+def _contains_standard_wallet(data_directory: Path) -> bool:
+    return any(
+        default_wallet_file(data_directory, network).is_file()
+        for network in SUPPORTED_NETWORKS
+    )
 
 
 def _validate_network(network: str) -> None:

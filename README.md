@@ -94,19 +94,23 @@ The Settings dialog contains only General, Network, and Storage:
 - Network selects the default Platform backend or a custom Esplora-compatible
   endpoint independently for Mainnet and Testnet4. A custom endpoint must pass
   a background genesis/network check before it can be saved.
-- Storage selects the bitcoin-tool default data directory or the directory
-  containing the network's standard wallet filename. Storage changes take
-  effect after restart; cache paths remain Platform-managed.
+- Storage uses Mini Bitcoin Wallet's application directory by default, or a
+  user-selected directory containing the network's standard wallet filename.
+  Storage changes take effect after restart; cache paths remain
+  Platform-managed.
 
 `settings.json` uses the strict Version 2 schema and is stored in Mini Bitcoin
-Wallet's stable `platformdirs` configuration directory. It is independent of
-wallet storage and contains no mnemonic, password, private key, or wallet JSON.
-Unknown/old settings versions are rejected rather than guessed or migrated.
+Wallet's stable `platformdirs` configuration directory. New installations keep
+`wallets.json`, `wallet_cache.json`, `wallets_testnet4.json`, and
+`wallet_cache_testnet4.json` in that same directory. Settings contains no
+mnemonic, password, private key, or wallet JSON. Unknown/old settings versions
+are rejected rather than guessed or migrated.
 
-On the first Version 2 launch, an existing wallet for the running network beside
-an older source build or packaged executable is selected by directory reference
-only when the corresponding bitcoin-tool default wallet does not exist. Wallet
-files are never moved, copied, merged, or deleted automatically.
+On the first Version 2 launch, existing data is protected using this directory
+priority: Mini Bitcoin Wallet default, bitcoin-tool default, then the older
+source/EXE directory. Both networks are checked. The chosen directory is only
+referenced; wallet files are never moved, copied, merged, or deleted
+automatically.
 
 Mnemonic discovery queries a public Esplora service and may reveal scanned
 addresses to that service.
@@ -136,9 +140,10 @@ python build_testnet4.py
 ```
 
 The outputs are `dist/mini_bitcoin_wallet.exe` and
-`dist/mini_bitcoin_wallet_testnet4.exe`. By default, packaged builds use the
-bitcoin-tool Platform data directory; Settings → Storage can select another
-directory containing the standard wallet filename.
+`dist/mini_bitcoin_wallet_testnet4.exe`. New packaged installations keep wallet
+and cache files beside the application settings in Mini Bitcoin Wallet's user
+configuration directory; Settings → Storage can select another directory
+containing the standard wallet filename.
 
 ## Update the vendored Platform
 

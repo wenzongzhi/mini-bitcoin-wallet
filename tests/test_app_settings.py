@@ -17,7 +17,8 @@ from app_settings import (
     create_backend_factory,
     default_application_settings_file,
     default_settings,
-    detect_legacy_wallet_data_dir,
+    default_wallet_data_dir,
+    select_initial_wallet_data_dir,
     unencrypted_http_warning,
     wallet_data_dir_from_selected_file,
 )
@@ -28,8 +29,9 @@ def test_new_settings_file_uses_complete_version_2_defaults() -> None:
     with TemporaryDirectory() as directory:
         path = Path(directory) / "settings.json"
         settings = ApplicationSettingsStore(path).load()
+        wallet_data_dir = path.parent.resolve()
 
-        assert settings == default_settings()
+        assert settings == default_settings(wallet_data_dir)
         assert json.loads(path.read_text(encoding="utf-8")) == {
             "version": 2,
             "active_wallets": {"mainnet": None, "testnet4": None},
@@ -49,7 +51,7 @@ def test_new_settings_file_uses_complete_version_2_defaults() -> None:
                     "custom_esplora_url": None,
                 },
             },
-            "storage": {"wallet_data_dir": None},
+            "storage": {"wallet_data_dir": str(wallet_data_dir)},
         }
 
 
@@ -193,6 +195,8 @@ def test_default_settings_file_uses_mini_wallet_config_directory(monkeypatch) ->
     expected = Path("X:/mini-config")
     monkeypatch.setattr(app_settings, "user_config_path", lambda *args, **kwargs: expected)
     assert default_application_settings_file() == expected / "settings.json"
+    assert default_wallet_data_dir() == expected
+    assert default_settings().storage.wallet_data_dir == expected.resolve()
 
 
 @pytest.mark.parametrize(
@@ -216,38 +220,74 @@ def test_platform_default_wallet_and_cache_paths_are_used_directly(
     assert default_wallet_cache_file(network=network) == data_directory / cache_name
 
 
-def test_legacy_detection_is_non_destructive_and_corresponding_default_wins(
+def test_new_mini_install_resolves_all_wallet_files_beside_settings(
+    tmp_path: Path,
+) -> None:
+    settings_file = tmp_path / "mini-bitcoin-wallet" / "settings.json"
+    store = ApplicationSettingsStore(settings_file)
+    wallet_data_dir = store.load().storage.wallet_data_dir
+
+    assert wallet_data_dir == settings_file.parent.resolve()
+    assert default_wallet_file(wallet_data_dir, "mainnet") == (
+        settings_file.parent.resolve() / "wallets.json"
+    )
+    assert default_wallet_cache_file(wallet_data_dir, "mainnet") == (
+        settings_file.parent.resolve() / "wallet_cache.json"
+    )
+    assert default_wallet_file(wallet_data_dir, "testnet4") == (
+        settings_file.parent.resolve() / "wallets_testnet4.json"
+    )
+    assert default_wallet_cache_file(wallet_data_dir, "testnet4") == (
+        settings_file.parent.resolve() / "wallet_cache_testnet4.json"
+    )
+
+
+def test_first_run_storage_selection_is_non_destructive_and_deterministic(
     monkeypatch,
 ) -> None:
-    with TemporaryDirectory() as platform, TemporaryDirectory() as legacy:
+    with (
+        TemporaryDirectory() as application,
+        TemporaryDirectory() as platform,
+        TemporaryDirectory() as legacy,
+    ):
         monkeypatch.setenv("BITCOIN_TOOL_DATADIR", platform)
+        application_path = Path(application).resolve()
+        platform_path = Path(platform).resolve()
         legacy_path = Path(legacy)
         legacy_wallet = default_wallet_file(legacy_path, "testnet4")
         legacy_wallet.write_text("do not read or change this", encoding="utf-8")
         before = legacy_wallet.read_bytes()
 
-        assert detect_legacy_wallet_data_dir(
-            legacy_path, "testnet4"
+        assert select_initial_wallet_data_dir(
+            application_path, legacy_path
         ) == legacy_path.resolve()
         assert legacy_wallet.read_bytes() == before
-        default_wallet_file(Path(platform), "mainnet").write_text(
-            "other network", encoding="utf-8"
+        default_wallet_file(platform_path, "mainnet").write_text(
+            "platform wallet", encoding="utf-8"
         )
-        assert detect_legacy_wallet_data_dir(
-            legacy_path, "testnet4"
-        ) == legacy_path.resolve()
-        default_wallet_file(Path(platform), "testnet4").write_text(
-            "platform wins", encoding="utf-8"
+        assert select_initial_wallet_data_dir(
+            application_path, legacy_path
+        ) == platform_path
+        default_wallet_file(application_path, "testnet4").write_text(
+            "application wallet", encoding="utf-8"
         )
-        assert detect_legacy_wallet_data_dir(legacy_path, "testnet4") is None
+        assert select_initial_wallet_data_dir(
+            application_path, legacy_path
+        ) == application_path
         assert legacy_wallet.read_bytes() == before
 
 
-def test_legacy_detection_ignores_nonstandard_wallet_filename(monkeypatch) -> None:
-    with TemporaryDirectory() as platform, TemporaryDirectory() as legacy:
+def test_first_run_storage_ignores_nonstandard_wallet_filename(monkeypatch) -> None:
+    with (
+        TemporaryDirectory() as application,
+        TemporaryDirectory() as platform,
+        TemporaryDirectory() as legacy,
+    ):
         monkeypatch.setenv("BITCOIN_TOOL_DATADIR", platform)
         Path(legacy, "wallet_old.json").write_text("ignored", encoding="utf-8")
-        assert detect_legacy_wallet_data_dir(legacy, "mainnet") is None
+        assert select_initial_wallet_data_dir(
+            application, legacy
+        ) == Path(application).resolve()
 
 
 @pytest.mark.parametrize(

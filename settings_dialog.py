@@ -157,6 +157,9 @@ class SettingsController:
         self.settings_store = settings_store
         self.network = network
         self.state = state
+        self.default_data_dir = StorageSettings(
+            settings_store.path.parent
+        ).wallet_data_dir
         self.original_settings = settings_store.load()
         self.original = SettingsDraft.from_settings(self.original_settings, network)
 
@@ -183,10 +186,16 @@ class SettingsController:
                 "Test this custom backend successfully before saving."
             )
 
-        # StorageSettings models a data directory, while the UI contract
-        # requires selecting an existing standard wallet file. Validate the
-        # derived file again at Save time in case it changed after selection.
-        if draft.storage.wallet_data_dir is not None:
+        # The application default may legitimately be empty before the first
+        # wallet is created. Validate a non-default location when the user
+        # actually changes it; an unchanged legacy directory may contain only
+        # the other network's wallet and must not block unrelated preferences.
+        application_default = self.default_data_dir
+        if (
+            draft.storage != self.original.storage
+            and draft.storage.wallet_data_dir is not None
+            and draft.storage.wallet_data_dir != application_default
+        ):
             draft = SettingsDraft(
                 general=draft.general,
                 backend=draft.backend,
@@ -254,6 +263,8 @@ class ApplicationSettingsDialog(tk.Toplevel):
         self.bind("<Escape>", lambda _event: self._cancel())
 
         original = self.controller.original
+        self.default_data_dir = self.controller.default_data_dir
+        configured_data_dir = original.storage.wallet_data_dir
         self.display_unit = tk.StringVar(self, value=original.general.display_unit)
         self.fiat_currency = tk.StringVar(self, value=original.general.fiat_currency)
         self.theme_name = tk.StringVar(
@@ -266,14 +277,18 @@ class ApplicationSettingsDialog(tk.Toplevel):
         )
         self.storage_mode = tk.StringVar(
             self,
-            value="custom" if original.storage.wallet_data_dir else "default",
+            value=(
+                "default"
+                if configured_data_dir == self.default_data_dir
+                else "custom"
+            ),
         )
         self.custom_data_dir = tk.StringVar(
             self,
             value=(
-                str(original.storage.wallet_data_dir)
-                if original.storage.wallet_data_dir is not None
-                else ""
+                str(configured_data_dir)
+                if configured_data_dir is not None
+                else str(default_wallet_file(network=self.network).parent)
             ),
         )
         self.wallet_path_text = tk.StringVar(self)
@@ -615,7 +630,7 @@ class ApplicationSettingsDialog(tk.Toplevel):
         self._field_label(page, "Wallet data").pack(fill="x")
         self._radio(
             page,
-            "Use bitcoin-tool default",
+            "Use Mini Bitcoin Wallet default",
             self.storage_mode,
             "default",
         ).pack(fill="x", pady=(3, 0))
@@ -776,7 +791,7 @@ class ApplicationSettingsDialog(tk.Toplevel):
 
     def _selected_data_dir(self) -> Path | None:
         if self.storage_mode.get() == "default":
-            return None
+            return self.default_data_dir
         value = self.custom_data_dir.get().strip()
         return Path(value) if value else None
 
@@ -797,8 +812,9 @@ class ApplicationSettingsDialog(tk.Toplevel):
         )
 
     def _choose_wallet_file(self) -> None:
-        expected = default_wallet_file(network=self.network)
-        initial_dir = self.custom_data_dir.get() or str(expected.parent)
+        data_dir = self._selected_data_dir() or self.default_data_dir
+        expected = default_wallet_file(data_dir=data_dir, network=self.network)
+        initial_dir = self.custom_data_dir.get() or str(self.default_data_dir)
         selected = filedialog.askopenfilename(
             parent=self,
             title="Choose Wallet File",
@@ -831,7 +847,7 @@ class ApplicationSettingsDialog(tk.Toplevel):
                 )
             storage = validated_custom_storage(data_dir, self.network)
         else:
-            storage = StorageSettings()
+            storage = StorageSettings(self.default_data_dir)
         return SettingsDraft(
             general=GeneralSettings(
                 display_unit=self.display_unit.get(),

@@ -81,7 +81,7 @@ def test_save_persists_complete_draft_and_applies_general_settings(tmp_path):
             hide_balance=True,
         ),
         backend=BackendSettings(),
-        storage=StorageSettings(),
+        storage=controller.original.storage,
     )
 
     result = controller.save(draft)
@@ -177,6 +177,34 @@ def test_missing_custom_wallet_file_is_rejected_at_save(tmp_path):
         controller.save(draft)
 
     assert state.applied == []
+
+
+def test_unchanged_legacy_storage_does_not_block_unrelated_save(tmp_path):
+    legacy_dir = tmp_path / "legacy-testnet-only"
+    legacy_dir.mkdir()
+    (legacy_dir / "wallets_testnet4.json").write_text("{}", encoding="utf-8")
+
+    store = ApplicationSettingsStore(tmp_path / "settings.json")
+    initial = store.load_or_create()
+    store.apply_preferences(
+        general=initial.general,
+        network="mainnet",
+        backend=initial.network["mainnet"],
+        storage=StorageSettings(legacy_dir),
+    )
+    state = FakeState()
+    controller = SettingsController(store, "mainnet", state)
+    draft = SettingsDraft(
+        general=GeneralSettings(display_unit="sats"),
+        backend=controller.original.backend,
+        storage=controller.original.storage,
+    )
+
+    result = controller.save(draft)
+
+    assert result.general_changed is True
+    assert result.restart_required is False
+    assert store.load().storage.wallet_data_dir == legacy_dir.resolve()
 
 
 def test_backend_change_requests_refresh_for_active_wallet(tmp_path):
