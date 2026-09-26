@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from decimal import ROUND_CEILING
+
 from .models import (
     AccountType,
     BitcoinAmount,
     BroadcastResult,
     DisplayUnit,
+    FeeRateEstimate,
+    FeeRateSchedule,
     TransactionStatus,
     WalletAccountActivation,
     WalletCreation,
@@ -20,6 +24,9 @@ from .ports import WalletService
 
 class WalletApplication:
     """Coordinates wallet use cases while keeping Tkinter out of the core."""
+
+    FEE_PRESET_TARGET_BLOCKS = (144, 24, 6, 1)
+    DEFAULT_CUSTOM_MAX_SAT_VB = 20
 
     def __init__(self, service: WalletService):
         self._service = service
@@ -61,6 +68,52 @@ class WalletApplication:
         ):
             raise ValueError("Transaction ID must be 64 hexadecimal characters.")
         return self._service.transaction_status(normalized)
+
+    def fee_estimates(self) -> tuple[FeeRateEstimate, ...]:
+        """Return normalized estimates from the configured network backend."""
+
+        estimates = self._service.fee_estimates()
+        if not estimates:
+            raise ValueError("The network backend returned no fee estimates.")
+        return tuple(sorted(estimates, key=lambda estimate: estimate.target_blocks))
+
+    def fee_rate_schedule(self) -> FeeRateSchedule:
+        """Map backend estimates to the four fee choices presented by the UI.
+
+        A target is matched to the closest estimate that is no slower than the
+        requested confirmation time. Decimal rates are rounded upward so the
+        wallet never underpays merely because the UI accepts whole sat/vB.
+        """
+
+        estimates = self.fee_estimates()
+        selected_rates: list[int] = []
+        for target in self.FEE_PRESET_TARGET_BLOCKS:
+            no_slower = tuple(
+                estimate
+                for estimate in estimates
+                if estimate.target_blocks <= target
+            )
+            selected = no_slower[-1] if no_slower else estimates[0]
+            rounded = int(selected.sat_vb.to_integral_value(rounding=ROUND_CEILING))
+            # Backends can occasionally publish a non-monotonic estimate set.
+            # Moving the UI toward "Fast" must never lower the selected rate.
+            if selected_rates:
+                rounded = max(rounded, selected_rates[-1])
+            selected_rates.append(rounded)
+
+        fastest = estimates[0]
+        custom_max = max(
+            self.DEFAULT_CUSTOM_MAX_SAT_VB,
+            int(
+                (fastest.sat_vb * 2).to_integral_value(
+                    rounding=ROUND_CEILING
+                )
+            ),
+        )
+        return FeeRateSchedule(
+            preset_sat_vb=tuple(selected_rates),
+            custom_max_sat_vb=custom_max,
+        )
 
     def get_mnemonic(self, password: str | None) -> str:
         return self._service.get_mnemonic(password)
@@ -135,9 +188,13 @@ class WalletApplication:
         normalized_destination = destination.strip()
         if not normalized_destination:
             raise ValueError("Enter a destination address.")
-        if isinstance(fee_rate_sat_vb, bool) or not 1 <= fee_rate_sat_vb <= 20:
+        if (
+            isinstance(fee_rate_sat_vb, bool)
+            or not isinstance(fee_rate_sat_vb, int)
+            or fee_rate_sat_vb <= 0
+        ):
             raise ValueError(
-                "Choose a fee rate from 1 to 20 sat/vB. "
+                "Choose a positive whole-number fee rate in sat/vB. "
                 "Zero-fee transactions are not accepted by bitcoin-tool or standard relays."
             )
         amount = None if send_all else BitcoinAmount.parse(amount_text, unit)

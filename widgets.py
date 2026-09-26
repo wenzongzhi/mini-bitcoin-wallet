@@ -829,14 +829,17 @@ class FeeTooltip:
 
 
 class FeeSlider(tk.Canvas):
-    PRESET_SAT_VB = (0, 1, 2, 3)
-    CUSTOM_MAX_SAT_VB = 20
+    CUSTOM_MIN_SAT_VB = 1
+    DEFAULT_CUSTOM_MAX_SAT_VB = 20
+    DEFAULT_PRESET_SAT_VB = (1, 1, 1, 1)
 
     def __init__(self, master, theme: Theme, fiat_text_callback, custom=False, active=False):
         self.theme = theme
         self.fiat_text_callback = fiat_text_callback
         self.custom = bool(custom)
         self.active = bool(active)
+        self.preset_sat_vb = self.DEFAULT_PRESET_SAT_VB
+        self.custom_max_sat_vb = self.DEFAULT_CUSTOM_MAX_SAT_VB
         self.value = 10 if self.custom else 2
         self.base_height = 44
         self._track_photo = None
@@ -857,7 +860,31 @@ class FeeSlider(tk.Canvas):
 
     def set_custom(self, custom):
         self.custom = bool(custom)
-        self.value = 10 if self.custom else 2
+        self.value = min(10, self.custom_max_sat_vb) if self.custom else 2
+        self._draw()
+
+    def set_fee_schedule(self, preset_sat_vb, custom_max_sat_vb):
+        """Apply product-level fee choices without querying a backend here."""
+
+        preset = tuple(preset_sat_vb)
+        if len(preset) != 4 or any(
+            isinstance(rate, bool) or not isinstance(rate, int) or rate <= 0
+            for rate in preset
+        ):
+            raise ValueError("Fee slider requires four positive integer presets.")
+        if (
+            isinstance(custom_max_sat_vb, bool)
+            or not isinstance(custom_max_sat_vb, int)
+            or custom_max_sat_vb < self.CUSTOM_MIN_SAT_VB
+        ):
+            raise ValueError("Custom fee maximum must be a positive integer.")
+        self.preset_sat_vb = preset
+        self.custom_max_sat_vb = custom_max_sat_vb
+        if self.custom:
+            self.value = max(
+                self.CUSTOM_MIN_SAT_VB,
+                min(int(self.value), self.custom_max_sat_vb),
+            )
         self._draw()
 
     def set_active(self, active):
@@ -868,7 +895,11 @@ class FeeSlider(tk.Canvas):
         self._draw()
 
     def current_sat_vb(self):
-        return int(self.value) if self.custom else int(self.PRESET_SAT_VB[int(self.value)])
+        return (
+            int(self.value)
+            if self.custom
+            else int(self.preset_sat_vb[int(self.value)])
+        )
 
     def _rescale(self, event=None):
         self.configure(height=self.theme.px(self.base_height))
@@ -900,7 +931,8 @@ class FeeSlider(tk.Canvas):
         margin = knob_r + self.theme.px(3)  # fixes endpoint clipping
         usable = max(1, w - margin * 2)
         ratio = (
-            int(self.value) / self.CUSTOM_MAX_SAT_VB
+            (int(self.value) - self.CUSTOM_MIN_SAT_VB)
+            / max(1, self.custom_max_sat_vb - self.CUSTOM_MIN_SAT_VB)
             if self.custom
             else int(self.value) / 3.0
         )
@@ -910,7 +942,11 @@ class FeeSlider(tk.Canvas):
         _, _, _, margin, usable, _, _ = self._geometry()
         ratio = max(0.0, min(1.0, (x-margin)/usable))
         self.value = (
-            round(ratio * self.CUSTOM_MAX_SAT_VB)
+            self.CUSTOM_MIN_SAT_VB
+            + round(
+                ratio
+                * (self.custom_max_sat_vb - self.CUSTOM_MIN_SAT_VB)
+            )
             if self.custom
             else round(ratio * 3)
         )

@@ -14,5 +14,6 @@ def test_scroll_thumb_clamps_invalid_fractions() -> None:
 
 
 def test_fee_slider_uses_requested_preset_and_custom_ranges() -> None:
-    assert FeeSlider.PRESET_SAT_VB == (0, 1, 2, 3)
-    assert FeeSlider.CUSTOM_MAX_SAT_VB == 20
+    assert FeeSlider.DEFAULT_PRESET_SAT_VB == (1, 1, 1, 1)
+    assert FeeSlider.CUSTOM_MIN_SAT_VB == 1
+    assert FeeSlider.DEFAULT_CUSTOM_MAX_SAT_VB == 20

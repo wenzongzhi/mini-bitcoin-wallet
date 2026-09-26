@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -9,7 +10,13 @@ from btc.chainparams import NETWORK_TESTNET4
 from explorer_links import transaction_explorer_url
 from tests.ui_test.demo_wallet import DemoWalletService
 from tx.codec import deserialize_transaction_hex, transaction_txid
-from wallet_core import AccountType, BitcoinAmount, DisplayUnit, WalletApplication
+from wallet_core import (
+    AccountType,
+    BitcoinAmount,
+    DisplayUnit,
+    FeeRateEstimate,
+    WalletApplication,
+)
 from wallet import get_new_address, get_wallet_address_book
 
 
@@ -21,6 +28,7 @@ class FakeEsploraBackend:
         network="mainnet",
         funded_ordinals=None,
         transaction_confirmed=False,
+        fee_estimates=None,
     ):
         self.network = network
         self.base_url = "https://example.invalid/api"
@@ -28,6 +36,13 @@ class FakeEsploraBackend:
         self._address_ordinals = {}
         self.transaction_query_count = 0
         self.transaction_confirmed = transaction_confirmed
+        self.fee_estimate_values = fee_estimates or {
+            1: Decimal("12.4"),
+            2: Decimal("10.1"),
+            6: Decimal("6.3"),
+            24: Decimal("3.2"),
+            144: Decimal("1.1"),
+        }
 
     def verify_network(self):
         return None
@@ -110,6 +125,9 @@ class FakeEsploraBackend:
             ),
         }
 
+    def get_fee_estimates(self):
+        return self.fee_estimate_values
+
 
 class BitcoinAmountTests(TestCase):
     def test_parses_btc_without_floating_point_rounding(self):
@@ -183,6 +201,33 @@ class WalletApplicationTests(TestCase):
                 "bc1qdestination", "0.001", DisplayUnit.BTC, 0
             )
 
+    def test_builds_dynamic_fee_schedule_and_rounds_rates_up(self):
+        schedule = self.application.fee_rate_schedule()
+
+        self.assertEqual(schedule.preset_sat_vb, (2, 4, 7, 13))
+        self.assertEqual(schedule.custom_max_sat_vb, 25)
+
+    def test_fee_target_uses_closest_estimate_that_is_not_slower(self):
+        class SparseFeeService(DemoWalletService):
+            def fee_estimates(self):
+                return (
+                    FeeRateEstimate(1, Decimal("3")),
+                    FeeRateEstimate(12, Decimal("2")),
+                    FeeRateEstimate(36, Decimal("1")),
+                )
+
+        schedule = WalletApplication(SparseFeeService()).fee_rate_schedule()
+
+        self.assertEqual(schedule.preset_sat_vb, (1, 2, 3, 3))
+
+    def test_fee_rate_is_not_limited_to_twenty_sat_vb(self):
+        draft = self.application.prepare_withdrawal(
+            "bc1qdestination", "0.001", DisplayUnit.BTC, 80
+        )
+
+        self.assertEqual(draft.fee_rate_sat_vb, 80)
+        self.assertEqual(draft.estimated_fee.sats, 11_200)
+
 
 class BitcoinToolWalletServiceTests(TestCase):
     def setUp(self):
@@ -211,6 +256,25 @@ class BitcoinToolWalletServiceTests(TestCase):
         self.assertEqual(self.service.list_wallets(), ())
         self.assertIs(self.service.settings_store, self.settings_store)
         self.assertIsNone(self.settings_store.active_wallet("mainnet"))
+
+    def test_fee_estimates_are_mapped_from_platform_service(self):
+        backend = FakeEsploraBackend(
+            fee_estimates={1: Decimal("8.25"), 6: Decimal("4.5")}
+        )
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "fee-cache.json",
+            settings_store=self.settings_store,
+            backend_factory=lambda _network: backend,
+        )
+
+        self.assertEqual(
+            service.fee_estimates(),
+            (
+                FeeRateEstimate(1, Decimal("8.25")),
+                FeeRateEstimate(6, Decimal("4.5")),
+            ),
+        )
 
     def test_multiple_wallets_can_coexist_and_be_listed_without_secrets(self):
         mnemonics = []

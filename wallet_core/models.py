@@ -107,6 +107,34 @@ class AddressDiscoverySummary:
 
 
 @dataclass(frozen=True, slots=True)
+class FeeRateEstimate:
+    """One backend fee-rate estimate for a confirmation target."""
+
+    target_blocks: int
+    sat_vb: Decimal
+
+    def __post_init__(self) -> None:
+        if isinstance(self.target_blocks, bool) or not isinstance(
+            self.target_blocks, int
+        ):
+            raise TypeError("fee target must be an integer number of blocks")
+        if self.target_blocks <= 0:
+            raise ValueError("fee target must be greater than zero")
+        if not isinstance(self.sat_vb, Decimal):
+            raise TypeError("fee rate must be a Decimal")
+        if not self.sat_vb.is_finite() or self.sat_vb <= 0:
+            raise ValueError("fee rate must be greater than zero")
+
+
+@dataclass(frozen=True, slots=True)
+class FeeRateSchedule:
+    """Product-ready fee choices derived from raw backend estimates."""
+
+    preset_sat_vb: tuple[int, int, int, int]
+    custom_max_sat_vb: int
+
+
+@dataclass(frozen=True, slots=True)
 class WalletSnapshot:
     name: str
     # `balance` is the effective aggregate amount shown by the UI. `account_type`

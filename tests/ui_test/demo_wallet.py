@@ -2,11 +2,13 @@
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from wallet_core.models import (
     AccountType,
     BitcoinAmount,
     BroadcastResult,
+    FeeRateEstimate,
     TransactionDirection,
     TransactionStatus,
     TransactionSummary,
@@ -115,6 +117,17 @@ class DemoWalletService(WalletService):
 
     def transaction_status(self, txid: str) -> TransactionStatus:
         return TransactionStatus(txid=txid, confirmed=True, block_height=1)
+
+    def fee_estimates(self) -> tuple[FeeRateEstimate, ...]:
+        """Return realistic deterministic estimates for UI development."""
+
+        return (
+            FeeRateEstimate(1, Decimal("12.4")),
+            FeeRateEstimate(2, Decimal("10.1")),
+            FeeRateEstimate(6, Decimal("6.3")),
+            FeeRateEstimate(24, Decimal("3.2")),
+            FeeRateEstimate(144, Decimal("1.1")),
+        )
 
     def get_mnemonic(self, password: str | None) -> str:
         return "demo mnemonic"

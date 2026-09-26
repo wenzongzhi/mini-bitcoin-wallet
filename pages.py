@@ -1,5 +1,7 @@
 import tkinter as tk
 import tkinter.font as tkfont
+from queue import Empty, Queue
+from threading import Thread
 from tkinter import messagebox
 
 from theme import Theme
@@ -530,10 +532,17 @@ class FeeAxis(tk.Frame):
         super().__init__(master, bg=theme.CARD, bd=0)
         self.theme = theme
         self.custom = False
+        self.preset_sat_vb = FeeSlider.DEFAULT_PRESET_SAT_VB
+        self.custom_max_sat_vb = FeeSlider.DEFAULT_CUSTOM_MAX_SAT_VB
         self.render()
 
     def set_custom(self, custom):
         self.custom = bool(custom)
+        self.render()
+
+    def set_fee_schedule(self, preset_sat_vb, custom_max_sat_vb):
+        self.preset_sat_vb = tuple(preset_sat_vb)
+        self.custom_max_sat_vb = int(custom_max_sat_vb)
         self.render()
 
     def render(self):
@@ -544,10 +553,22 @@ class FeeAxis(tk.Frame):
         if self.custom:
             self.grid_columnconfigure(0, weight=1)
             self.grid_columnconfigure(1, weight=1)
-            tk.Label(self, text="Slow · 0 sat/vB", bg=self.theme.CARD, fg=self.theme.MUTED_2,
-                     font=self.theme.font_small, anchor="w").grid(row=0, column=0, sticky="ew")
-            tk.Label(self, text="Fast · 20 sat/vB", bg=self.theme.CARD, fg=self.theme.MUTED_2,
-                     font=self.theme.font_small, anchor="e").grid(row=0, column=1, sticky="ew")
+            tk.Label(
+                self,
+                text="Slow · 1 sat/vB",
+                bg=self.theme.CARD,
+                fg=self.theme.MUTED_2,
+                font=self.theme.font_small,
+                anchor="w",
+            ).grid(row=0, column=0, sticky="ew")
+            tk.Label(
+                self,
+                text=f"Fast · {self.custom_max_sat_vb} sat/vB",
+                bg=self.theme.CARD,
+                fg=self.theme.MUTED_2,
+                font=self.theme.font_small,
+                anchor="e",
+            ).grid(row=0, column=1, sticky="ew")
         else:
             labels = ("~ 24 hrs", "~ 4 hrs", "~ 60 min", "~ 10 min")
             for i, text in enumerate(labels):
@@ -555,6 +576,14 @@ class FeeAxis(tk.Frame):
                 anchor = "w" if i == 0 else ("e" if i == 3 else "center")
                 tk.Label(self, text=text, bg=self.theme.CARD, fg=self.theme.MUTED_2,
                          font=self.theme.font_small, anchor=anchor).grid(row=0, column=i, sticky="ew")
+                tk.Label(
+                    self,
+                    text=f"{self.preset_sat_vb[i]} sat/vB",
+                    bg=self.theme.CARD,
+                    fg=self.theme.MUTED_2,
+                    font=self.theme.font_small,
+                    anchor=anchor,
+                ).grid(row=1, column=i, sticky="ew")
 
 
 class SendPage(PageBase):
@@ -613,13 +642,32 @@ class SendPage(PageBase):
         self.custom_toggle.pack(side="left", padx=(0, theme.px(7)))
         tk.Label(custom_box, text="Custom", bg=theme.CARD, fg=theme.MUTED,
                  font=theme.font_small).pack(side="left")
+        self.fee_status = tk.Label(
+            fee_header,
+            text="",
+            bg=theme.CARD,
+            fg=theme.MUTED_2,
+            font=theme.font_small,
+            anchor="w",
+        )
+        self.fee_status.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            pady=(theme.px(2), 0),
+        )
+
+        self._fee_results = Queue()
+        self._fee_loading = False
+        self._has_fee_schedule = False
 
         self.fee_slider = FeeSlider(
             form,
             theme,
             fiat_text_callback=state.fiat_zero_text,
             custom=state.custom_fee.get(),
-            active=state.is_initialized,
+            active=False,
         )
         self.fee_slider.grid(row=5, column=0, sticky="ew", pady=(theme.px(3), 0))
         self.fee_axis = FeeAxis(form, theme)
@@ -647,6 +695,7 @@ class SendPage(PageBase):
         self.state.custom_fee.set(bool(checked))
         self.fee_slider.set_custom(checked)
         self.fee_axis.set_custom(checked)
+        self._update_fee_active()
 
     def _toggle_send_all(self, checked):
         self.state.send_all.set(bool(checked))
@@ -654,7 +703,8 @@ class SendPage(PageBase):
         self._update_fee_active()
 
     def _update_fee_active(self):
-        self.fee_slider.set_active(self.state.is_initialized)
+        can_choose_fee = self.state.custom_fee.get() or self._has_fee_schedule
+        self.fee_slider.set_active(self.state.is_initialized and can_choose_fee)
 
     def _wallet_changed(self):
         self.max_toggle.set_checked(self.state.send_all.get())
@@ -664,9 +714,65 @@ class SendPage(PageBase):
         self._update_fee_active()
 
     def _review_send(self):
+        if not self.state.custom_fee.get() and not self._has_fee_schedule:
+            messagebox.showerror(
+                "Transaction Fee",
+                "Network fee estimates are unavailable. Enable Custom and "
+                "choose a positive fee rate before reviewing the withdrawal.",
+                parent=self,
+            )
+            return
         review_withdrawal(
             self.winfo_toplevel(),
             self.theme,
             self.state,
             self.fee_slider.current_sat_vb(),
         )
+
+    def on_show(self):
+        """Refresh network estimates once whenever the Send page is opened."""
+
+        if not self.state.is_initialized or self._fee_loading:
+            return
+        self._fee_loading = True
+        self.fee_status.configure(text="Updating network fee estimates…")
+        self._update_fee_active()
+        Thread(target=self._load_fee_schedule, daemon=True).start()
+        self.after(100, self._poll_fee_schedule)
+
+    def _load_fee_schedule(self):
+        try:
+            schedule = self.state.fee_rate_schedule()
+        except Exception as exc:  # Network and configured backend failures are UI data.
+            self._fee_results.put((None, str(exc)))
+        else:
+            self._fee_results.put((schedule, None))
+
+    def _poll_fee_schedule(self):
+        try:
+            schedule, _error = self._fee_results.get_nowait()
+        except Empty:
+            self.after(100, self._poll_fee_schedule)
+            return
+
+        self._fee_loading = False
+        if schedule is None:
+            if self._has_fee_schedule:
+                message = "Fee update unavailable · using previous estimates"
+            else:
+                message = "Fee estimate unavailable · use Custom"
+            self.fee_status.configure(text=message)
+            self._update_fee_active()
+            return
+
+        self.fee_slider.set_fee_schedule(
+            schedule.preset_sat_vb,
+            schedule.custom_max_sat_vb,
+        )
+        self.fee_axis.set_fee_schedule(
+            schedule.preset_sat_vb,
+            schedule.custom_max_sat_vb,
+        )
+        self._has_fee_schedule = True
+        self.fee_status.configure(text="Network fee estimates updated")
+        self._update_fee_active()

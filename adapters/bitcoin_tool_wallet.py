@@ -22,6 +22,7 @@ from wallet_core.models import (
     AddressDiscoverySummary,
     BitcoinAmount,
     BroadcastResult,
+    FeeRateEstimate,
     TransactionDirection,
     TransactionStatus,
     TransactionSummary,
@@ -158,6 +159,21 @@ class BitcoinToolWalletService(WalletService):
             )
         except WalletError as exc:
             raise ValueError(str(exc)) from exc
+
+    def fee_estimates(self) -> tuple[FeeRateEstimate, ...]:
+        """Translate bitcoin-tool fee DTOs at the Platform boundary."""
+
+        try:
+            estimates = self.platform_payment.estimate_fee()
+        except TransactionError as exc:
+            raise ValueError(str(exc)) from exc
+        return tuple(
+            FeeRateEstimate(
+                target_blocks=estimate.target_blocks,
+                sat_vb=estimate.sat_vb,
+            )
+            for estimate in estimates
+        )
 
     def snapshot(self) -> WalletSnapshot:
         wallet_name, account_type = self._active_selection()

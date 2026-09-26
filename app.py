@@ -139,6 +139,7 @@ class BitcoinWalletApp(tk.Tk):
 
     def show_send(self):
         self._show("send")
+        self.pages["send"].on_show()
 
 
 def run_wallet_app(

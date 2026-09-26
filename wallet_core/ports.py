@@ -8,6 +8,7 @@ from .models import (
     AccountType,
     BitcoinAmount,
     BroadcastResult,
+    FeeRateEstimate,
     TransactionStatus,
     WalletAccountActivation,
     WalletCreation,
@@ -51,6 +52,10 @@ class WalletService(ABC):
     @abstractmethod
     def transaction_status(self, txid: str) -> TransactionStatus:
         """Fetch one transaction's confirmation status without scanning addresses."""
+
+    @abstractmethod
+    def fee_estimates(self) -> tuple[FeeRateEstimate, ...]:
+        """Return backend fee estimates without exposing Platform DTOs."""
 
     @abstractmethod
     def get_mnemonic(self, password: str | None) -> str:

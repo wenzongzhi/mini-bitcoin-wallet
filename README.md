@@ -167,6 +167,9 @@ bitcoin-tool commit pinned in `tools/platform_upstream.json`. Update them only
 with the local synchronization tool; it cannot overwrite product-owned
 directories.
 
+See [tools/README.md](tools/README.md) for the complete command-line workflow,
+safety rules, exit codes, and troubleshooting guide.
+
 ```bash
 # 1. Complete and test the bitcoin-tool change, then commit it.
 # 2. Check out the intended bitcoin-tool branch/commit.
@@ -203,6 +206,7 @@ mini-bitcoin-wallet/
 ├── wallet_settings_dialog.py
 ├── tests/
 ├── tools/
+│   ├── README.md
 │   ├── platform_upstream.json
 │   └── sync_bitcoin_tool_platform.py
 ├── requirements.txt

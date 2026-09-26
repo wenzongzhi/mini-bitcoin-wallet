@@ -11,6 +11,7 @@ from wallet_core import (
     AccountType,
     BitcoinAmount,
     DisplayUnit,
+    FeeRateSchedule,
     WalletApplication,
     WalletAccountActivation,
     WalletCreation,
@@ -283,6 +284,11 @@ class WalletUIState:
             fee_rate_sat_vb,
             send_all=self.send_all.get(),
         )
+
+    def fee_rate_schedule(self) -> FeeRateSchedule:
+        """Load product-ready fee choices without coupling pages to Platform."""
+
+        return self.application.fee_rate_schedule()
 
     def sign_withdrawal(
         self, draft_id: str, password: str | None
