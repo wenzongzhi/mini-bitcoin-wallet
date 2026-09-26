@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import RLock
 from typing import Callable
 
-from app_settings import ApplicationSettingsStore
+from app_settings import ActiveWalletSelection, ApplicationSettingsStore
 from btc.chainparams import NETWORK_MAINNET
 from tx.service import PaymentService as PlatformPaymentService
 from tx.service import TransactionError
@@ -17,12 +18,14 @@ from wallet.service import WalletMetadata as PlatformWalletMetadata
 from wallet.service import WalletService as PlatformWalletService
 from wallet.service import WalletState as PlatformWalletState
 from wallet_core.models import (
+    AccountType,
     AddressDiscoverySummary,
     BitcoinAmount,
     BroadcastResult,
     TransactionDirection,
     TransactionStatus,
     TransactionSummary,
+    WalletAccountActivation,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
@@ -55,7 +58,8 @@ class BitcoinToolWalletService(WalletService):
             backend_factory,
         )
         self.platform_payment = PlatformPaymentService(self.platform_wallet)
-        self._wallet_name = self._resolve_active_wallet()
+        self._selection_lock = RLock()
+        self._wallet_name, self._account_type = self._resolve_active_wallet()
 
     def list_wallets(self) -> tuple[WalletSummary, ...]:
         try:
@@ -66,10 +70,11 @@ class BitcoinToolWalletService(WalletService):
         except WalletError as exc:
             raise ValueError(str(exc)) from exc
 
-    def _resolve_active_wallet(self) -> str | None:
+    def _resolve_active_wallet(self) -> tuple[str | None, AccountType]:
         wallets = self.list_wallets()
         wallet_names = {wallet.name for wallet in wallets}
-        configured_name = self.settings_store.active_wallet(self.network)
+        configured = self.settings_store.active_wallet_selection(self.network)
+        configured_name = configured.wallet_name
         selected_name = (
             configured_name
             if configured_name in wallet_names
@@ -77,19 +82,74 @@ class BitcoinToolWalletService(WalletService):
         )
         if selected_name != configured_name:
             self.settings_store.set_active_wallet(self.network, selected_name)
-        return selected_name
+            return selected_name, AccountType.NATIVE_SEGWIT
+        return selected_name, configured.account_type
 
     def select_wallet(self, name: str) -> WalletSnapshot:
         if name not in {wallet.name for wallet in self.list_wallets()}:
             raise ValueError(f'Wallet "{name}" does not exist on {self.network}.')
-        self._activate_wallet(name)
-        return self.snapshot()
-
-    def synchronize_wallet(self, name: str) -> WalletSnapshot:
+        account_type = AccountType.NATIVE_SEGWIT
         try:
-            return self._wallet_snapshot(self.platform_wallet.sync_wallet(name))
+            state = self.platform_wallet.get_wallet_state(
+                name,
+                address_type=account_type.value,
+            )
         except WalletError as exc:
             raise ValueError(str(exc)) from exc
+        self._activate_wallet(name)
+        return self._wallet_snapshot(state, account_type)
+
+    def select_account_type(
+        self,
+        account_type: AccountType,
+    ) -> WalletAccountActivation:
+        """Enable an account before atomically making it the UI selection."""
+
+        selected_type = self._validated_account_type(account_type)
+        wallet_name, _current_type = self._active_selection()
+        if wallet_name is None:
+            raise ValueError("Create or import a wallet before continuing.")
+        try:
+            result = self.platform_wallet.enable_account(
+                wallet_name,
+                selected_type.value,
+            )
+        except WalletError as exc:
+            raise ValueError(str(exc)) from exc
+
+        # Persist with an expected-wallet guard before changing in-memory
+        # selection. A slow discovery can therefore never reactivate a wallet
+        # that the user switched away from in the meantime.
+        with self._selection_lock:
+            if self._wallet_name != wallet_name:
+                raise ValueError(
+                    "The active wallet changed while its account was enabled."
+                )
+            self.settings_store.set_active_account_type(
+                self.network,
+                selected_type,
+                expected_wallet_name=wallet_name,
+            )
+            self._account_type = selected_type
+        return WalletAccountActivation(
+            snapshot=self._wallet_snapshot(result.state, selected_type),
+            account_type=selected_type,
+            discovery=self._discovery_summary(result.discovery),
+        )
+
+    def synchronize_wallet(self, name: str) -> WalletSnapshot:
+        wallet_name, account_type = self._active_selection()
+        selected_type = (
+            account_type if name == wallet_name else AccountType.NATIVE_SEGWIT
+        )
+        try:
+            state = self.platform_wallet.sync_wallet(
+                name,
+                address_type=selected_type.value,
+            )
+        except WalletError as exc:
+            raise ValueError(str(exc)) from exc
+        return self._wallet_snapshot(state, selected_type)
 
     def transaction_status(self, txid: str) -> TransactionStatus:
         try:
@@ -100,11 +160,13 @@ class BitcoinToolWalletService(WalletService):
             raise ValueError(str(exc)) from exc
 
     def snapshot(self) -> WalletSnapshot:
-        if self._wallet_name is None:
+        wallet_name, account_type = self._active_selection()
+        if wallet_name is None:
             return WalletSnapshot(
                 name="No Wallet",
                 balance=BitcoinAmount(0),
                 receive_address="",
+                account_type=AccountType.NATIVE_SEGWIT,
                 authoritative_balance=BitcoinAmount(0),
                 confirmed_balance=BitcoinAmount(0),
                 unconfirmed_chain_balance=BitcoinAmount(0),
@@ -115,15 +177,22 @@ class BitcoinToolWalletService(WalletService):
                 is_initialized=False,
             )
         try:
-            return self._wallet_snapshot(
-                self.platform_wallet.get_wallet_state(self._wallet_name)
+            state = self.platform_wallet.get_wallet_state(
+                wallet_name,
+                address_type=account_type.value,
             )
         except WalletError as exc:
             raise ValueError(str(exc)) from exc
+        return self._wallet_snapshot(state, account_type)
 
     def create_wallet(self, name: str, password: str) -> WalletCreation:
+        account_type = AccountType.NATIVE_SEGWIT
         try:
-            result = self.platform_wallet.create_wallet(name, password)
+            result = self.platform_wallet.create_wallet(
+                name,
+                password,
+                address_type=account_type.value,
+            )
         except WalletError as exc:
             raise ValueError(str(exc)) from exc
         if result.generated_mnemonic is None:
@@ -132,6 +201,7 @@ class BitcoinToolWalletService(WalletService):
         return self._creation_result(
             result,
             generated_mnemonic=result.generated_mnemonic,
+            account_type=account_type,
         )
 
     def import_wallet(
@@ -140,15 +210,25 @@ class BitcoinToolWalletService(WalletService):
         password: str,
         mnemonic: str,
     ) -> WalletCreation:
+        account_type = AccountType.NATIVE_SEGWIT
         try:
-            result = self.platform_wallet.import_wallet(name, password, mnemonic)
+            result = self.platform_wallet.import_wallet(
+                name,
+                password,
+                mnemonic,
+                address_type=account_type.value,
+            )
         except WalletError as exc:
             raise ValueError(str(exc)) from exc
         self._activate_wallet(name)
         # Imported recovery words are caller-owned input.  Never propagate
         # them into product DTOs, even if a future Platform implementation
         # accidentally populates the optional field.
-        return self._creation_result(result, generated_mnemonic=None)
+        return self._creation_result(
+            result,
+            generated_mnemonic=None,
+            account_type=account_type,
+        )
 
     def get_mnemonic(self, password: str | None) -> str:
         wallet_name = self._require_active_wallet()
@@ -162,39 +242,56 @@ class BitcoinToolWalletService(WalletService):
         name: str,
         password: str | None = None,
     ) -> WalletSnapshot:
-        wallet_name = self._require_active_wallet()
+        wallet_name, account_type = self._require_active_selection()
         try:
-            state = self.platform_wallet.rename_wallet(wallet_name, name, password)
+            state = self.platform_wallet.rename_wallet(
+                wallet_name,
+                name,
+                password,
+                address_type=account_type.value,
+            )
         except WalletError as exc:
             raise ValueError(str(exc)) from exc
-        self._activate_wallet(name)
-        return self._wallet_snapshot(state)
+        with self._selection_lock:
+            if self._wallet_name != wallet_name:
+                raise ValueError(
+                    "The active wallet changed while it was being renamed."
+                )
+            self.settings_store.set_active_wallet_selection(
+                self.network,
+                ActiveWalletSelection(name, account_type),
+                expected_wallet_name=wallet_name,
+            )
+            self._wallet_name = name
+            self._account_type = account_type
+        return self._wallet_snapshot(state, account_type)
 
     def change_password(
         self,
         current_password: str | None,
         new_password: str | None,
     ) -> WalletSnapshot:
-        wallet_name = self._require_active_wallet()
+        wallet_name, account_type = self._require_active_selection()
         try:
             state = self.platform_wallet.change_password(
                 wallet_name,
                 current_password,
                 new_password,
+                address_type=account_type.value,
             )
         except WalletError as exc:
             raise ValueError(str(exc)) from exc
-        return self._wallet_snapshot(state)
+        return self._wallet_snapshot(state, account_type)
 
     def remove_wallet(self, password: str | None) -> WalletSnapshot:
-        wallet_name = self._require_active_wallet()
+        wallet_name, _account_type = self._require_active_selection()
         try:
             self.platform_wallet.remove_wallet(wallet_name, password)
         except WalletError as exc:
             raise ValueError(str(exc)) from exc
         remaining = self.list_wallets()
-        self._wallet_name = remaining[0].name if remaining else None
-        self.settings_store.set_active_wallet(self.network, self._wallet_name)
+        selected_name = remaining[0].name if remaining else None
+        self._activate_wallet(selected_name)
         return self.snapshot()
 
     def prepare_withdrawal(
@@ -205,7 +302,7 @@ class BitcoinToolWalletService(WalletService):
         *,
         send_all: bool = False,
     ) -> WithdrawalDraft:
-        wallet_name = self._require_active_wallet()
+        wallet_name, account_type = self._require_active_selection()
         try:
             draft = self.platform_payment.prepare(
                 wallet_name,
@@ -213,18 +310,20 @@ class BitcoinToolWalletService(WalletService):
                 None if amount is None else amount.sats,
                 fee_rate_sat_vb,
                 send_all=send_all,
+                address_type=account_type.value,
             )
         except (TransactionError, WalletError) as exc:
             raise ValueError(str(exc)) from exc
         return WithdrawalDraft(
-            draft.draft_id,
-            draft.wallet_name,
-            draft.network,
-            draft.destination,
-            BitcoinAmount(draft.amount_sats),
-            BitcoinAmount(draft.estimated_fee_sats),
-            draft.fee_rate_sat_vb,
-            draft.send_all,
+            draft_id=draft.draft_id,
+            wallet_name=draft.wallet_name,
+            network=draft.network,
+            destination=draft.destination,
+            amount=BitcoinAmount(draft.amount_sats),
+            estimated_fee=BitcoinAmount(draft.estimated_fee_sats),
+            fee_rate_sat_vb=draft.fee_rate_sat_vb,
+            send_all=draft.send_all,
+            account_type=self._validated_account_type(draft.address_type),
         )
 
     def sign_withdrawal(
@@ -237,15 +336,16 @@ class BitcoinToolWalletService(WalletService):
         except (TransactionError, WalletError) as exc:
             raise ValueError(str(exc)) from exc
         return WithdrawalReview(
-            payment.payment_id,
-            payment.wallet_name,
-            payment.network,
-            payment.txid,
-            payment.destination,
-            BitcoinAmount(payment.amount_sats),
-            BitcoinAmount(payment.fee_sats),
-            payment.fee_rate_sat_vb,
-            payment.send_all,
+            review_id=payment.payment_id,
+            wallet_name=payment.wallet_name,
+            network=payment.network,
+            txid=payment.txid,
+            destination=payment.destination,
+            amount=BitcoinAmount(payment.amount_sats),
+            fee=BitcoinAmount(payment.fee_sats),
+            fee_rate_sat_vb=payment.fee_rate_sat_vb,
+            send_all=payment.send_all,
+            account_type=self._validated_account_type(payment.address_type),
         )
 
     def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:
@@ -265,40 +365,51 @@ class BitcoinToolWalletService(WalletService):
         except (TransactionError, WalletError) as exc:
             raise ValueError(str(exc)) from exc
 
-    def _activate_wallet(self, name: str) -> None:
-        self._wallet_name = name
-        self.settings_store.set_active_wallet(self.network, name)
+    def _activate_wallet(self, name: str | None) -> None:
+        """Activate a wallet at the product's Native SegWit default."""
+
+        with self._selection_lock:
+            self.settings_store.set_active_wallet(self.network, name)
+            self._wallet_name = name
+            self._account_type = AccountType.NATIVE_SEGWIT
+
+    def _active_selection(self) -> tuple[str | None, AccountType]:
+        with self._selection_lock:
+            return self._wallet_name, self._account_type
+
+    def _require_active_selection(self) -> tuple[str, AccountType]:
+        wallet_name, account_type = self._active_selection()
+        if wallet_name is None:
+            raise ValueError("Create or import a wallet before continuing.")
+        return wallet_name, account_type
 
     def _require_active_wallet(self) -> str:
-        if self._wallet_name is None:
-            raise ValueError("Create or import a wallet before continuing.")
-        return self._wallet_name
+        wallet_name, _account_type = self._require_active_selection()
+        return wallet_name
 
     def _creation_result(
         self,
         result: PlatformWalletCreationResult,
         *,
         generated_mnemonic: str | None,
+        account_type: AccountType,
     ) -> WalletCreation:
-        discovery = None
-        if result.discovery is not None:
-            discovery = AddressDiscoverySummary(
-                receive_scanned=result.discovery.receive.scanned_count,
-                change_scanned=result.discovery.change.scanned_count,
-                receive_used=len(result.discovery.receive.used_indexes),
-                change_used=len(result.discovery.change.used_indexes),
-            )
         return WalletCreation(
-            snapshot=self._wallet_snapshot(result.state),
+            snapshot=self._wallet_snapshot(result.state, account_type),
             generated_mnemonic=generated_mnemonic,
-            discovery=discovery,
+            discovery=self._discovery_summary(result.discovery),
         )
 
-    def _wallet_snapshot(self, state: PlatformWalletState) -> WalletSnapshot:
+    def _wallet_snapshot(
+        self,
+        state: PlatformWalletState,
+        account_type: AccountType,
+    ) -> WalletSnapshot:
         return WalletSnapshot(
             name=state.metadata.name,
             balance=BitcoinAmount(state.effective_balance_sats),
             receive_address=state.receive_address,
+            account_type=self._validated_account_type(account_type),
             authoritative_balance=BitcoinAmount(state.authoritative_balance_sats),
             confirmed_balance=BitcoinAmount(state.confirmed_balance_sats),
             unconfirmed_chain_balance=BitcoinAmount(
@@ -314,6 +425,24 @@ class BitcoinToolWalletService(WalletService):
             is_initialized=True,
             synced_at=state.synced_at,
             pending_txids=state.pending_txids,
+        )
+
+    @staticmethod
+    def _validated_account_type(value: AccountType | str) -> AccountType:
+        try:
+            return AccountType(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Unsupported wallet account type.") from exc
+
+    @staticmethod
+    def _discovery_summary(discovery) -> AddressDiscoverySummary | None:
+        if discovery is None:
+            return None
+        return AddressDiscoverySummary(
+            receive_scanned=discovery.receive.scanned_count,
+            change_scanned=discovery.change.scanned_count,
+            receive_used=len(discovery.receive.used_indexes),
+            change_used=len(discovery.change.used_indexes),
         )
 
     @staticmethod

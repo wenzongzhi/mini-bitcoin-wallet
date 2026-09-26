@@ -1,8 +1,8 @@
 """Versioned, non-secret settings for Mini Bitcoin Wallet.
 
-The application settings file deliberately lives outside the bitcoin-tool
-wallet data directory. It contains product preferences and references to
-wallet storage, never wallet secrets or Platform wallet data.
+The settings file contains product preferences and a wallet-storage reference,
+never wallet secrets or Platform wallet data. New installations keep settings
+and Platform wallet files in the same application-specific directory.
 """
 
 from __future__ import annotations
@@ -24,15 +24,21 @@ from platformdirs import user_config_path
 from btc.chainparams import NETWORK_MAINNET, NETWORK_TESTNET4
 from network import EsploraBackend
 from wallet import default_wallet_file
+from wallet_core.models import AccountType
 
 
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
+MIGRATABLE_SETTINGS_VERSION = 2
 APPLICATION_NAME = "mini-bitcoin-wallet"
 SUPPORTED_NETWORKS = (NETWORK_MAINNET, NETWORK_TESTNET4)
 SUPPORTED_DISPLAY_UNITS = ("BTC", "sats")
 SUPPORTED_FIAT_CURRENCIES = ("USD", "JPY", "CNY", "EUR")
 SUPPORTED_THEMES = ("system", "light", "dark")
 SUPPORTED_BACKEND_MODES = ("default", "custom")
+SUPPORTED_ACCOUNT_TYPES = (
+    AccountType.NATIVE_SEGWIT,
+    AccountType.LEGACY,
+)
 
 
 class SettingsError(ValueError):
@@ -44,7 +50,7 @@ class UnsupportedSettingsVersionError(SettingsError):
 
 
 class SettingsValidationError(SettingsError):
-    """Raised when a Version 2 settings value violates its schema."""
+    """Raised when an application settings value violates its schema."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,11 +119,34 @@ class StorageSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ActiveWalletSelection:
+    """The active wallet and account used for one Bitcoin network."""
+
+    wallet_name: str | None
+    account_type: AccountType = AccountType.NATIVE_SEGWIT
+
+    def __post_init__(self) -> None:
+        _validate_wallet_name(self.wallet_name)
+        if (
+            not isinstance(self.account_type, AccountType)
+            or self.account_type not in SUPPORTED_ACCOUNT_TYPES
+        ):
+            raise SettingsValidationError("Unsupported active wallet account type.")
+        if (
+            self.wallet_name is None
+            and self.account_type is not AccountType.NATIVE_SEGWIT
+        ):
+            raise SettingsValidationError(
+                "A missing active wallet must use the default account type."
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ApplicationSettings:
-    """An immutable, fully validated Version 2 settings snapshot."""
+    """An immutable, fully validated Version 3 settings snapshot."""
 
     version: int
-    active_wallets: Mapping[str, str | None]
+    active_wallets: Mapping[str, ActiveWalletSelection]
     general: GeneralSettings
     network: Mapping[str, BackendSettings]
     storage: StorageSettings
@@ -160,7 +189,7 @@ def default_wallet_data_dir(
 def default_settings(
     wallet_data_dir: str | os.PathLike[str] | None = None,
 ) -> ApplicationSettings:
-    """Return a fresh Version 2 settings snapshot.
+    """Return a fresh Version 3 settings snapshot.
 
     New installations keep wallet data beside the Mini Bitcoin Wallet settings
     file.
@@ -172,7 +201,10 @@ def default_settings(
 
     return ApplicationSettings(
         version=SETTINGS_VERSION,
-        active_wallets={network: None for network in SUPPORTED_NETWORKS},
+        active_wallets={
+            network: ActiveWalletSelection(None)
+            for network in SUPPORTED_NETWORKS
+        },
         general=GeneralSettings(),
         network={network: BackendSettings() for network in SUPPORTED_NETWORKS},
         storage=StorageSettings(selected_wallet_dir),
@@ -259,7 +291,7 @@ def create_backend_factory(
 
 
 class ApplicationSettingsStore:
-    """Read and atomically update Mini Bitcoin Wallet's Version 2 settings."""
+    """Read and atomically update Mini Bitcoin Wallet's Version 3 settings."""
 
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path is not None else default_application_settings_file()
@@ -281,7 +313,7 @@ class ApplicationSettingsStore:
             return settings
 
     def load(self) -> ApplicationSettings:
-        """Load settings, creating the Version 2 defaults when absent."""
+        """Load settings, creating the Version 3 defaults when absent."""
 
         return self.load_or_create()
 
@@ -301,25 +333,73 @@ class ApplicationSettingsStore:
         return self.load().storage.wallet_data_dir
 
     def active_wallet(self, network: str) -> str | None:
+        """Return the active wallet name for compatibility with existing callers."""
+
+        return self.active_wallet_selection(network).wallet_name
+
+    def active_wallet_selection(self, network: str) -> ActiveWalletSelection:
         _validate_network(network)
         return self.load().active_wallets[network]
+
+    def active_account_type(self, network: str) -> AccountType:
+        return self.active_wallet_selection(network).account_type
 
     def set_active_wallet(
         self,
         network: str,
         wallet_name: str | None,
     ) -> ApplicationSettings:
-        """Persist one active wallet without changing product preferences."""
+        """Activate a wallet on its default Native SegWit account."""
 
         _validate_network(network)
         _validate_wallet_name(wallet_name)
         with self._locked():
             current = self._read_unlocked()
             active_wallets = dict(current.active_wallets)
-            active_wallets[network] = wallet_name
+            active_wallets[network] = ActiveWalletSelection(wallet_name)
             updated = replace(current, active_wallets=active_wallets)
             self._write_unlocked(updated)
             return updated
+
+    def set_active_wallet_selection(
+        self,
+        network: str,
+        selection: ActiveWalletSelection,
+        *,
+        expected_wallet_name: str | None,
+    ) -> ApplicationSettings:
+        """Compare and atomically replace one network's complete selection."""
+
+        _validate_network(network)
+        _validate_wallet_name(expected_wallet_name)
+        if not isinstance(selection, ActiveWalletSelection):
+            raise SettingsValidationError("Invalid active wallet selection.")
+        with self._locked():
+            current = self._read_unlocked()
+            if current.active_wallets[network].wallet_name != expected_wallet_name:
+                raise SettingsValidationError(
+                    "The active wallet changed before its settings were saved."
+                )
+            active_wallets = dict(current.active_wallets)
+            active_wallets[network] = selection
+            updated = replace(current, active_wallets=active_wallets)
+            self._write_unlocked(updated)
+            return updated
+
+    def set_active_account_type(
+        self,
+        network: str,
+        account_type: AccountType,
+        *,
+        expected_wallet_name: str | None,
+    ) -> ApplicationSettings:
+        """Atomically select an account for the expected active wallet."""
+
+        return self.set_active_wallet_selection(
+            network,
+            ActiveWalletSelection(expected_wallet_name, account_type),
+            expected_wallet_name=expected_wallet_name,
+        )
 
     def apply_preferences(
         self,
@@ -333,7 +413,7 @@ class ApplicationSettingsStore:
 
         Only the current network's backend is replaced. The other network and
         both active-wallet values are reloaded under the file lock so a dialog
-        opened earlier cannot overwrite a more recent wallet selection.
+        opened earlier cannot overwrite a more recent wallet/account selection.
         """
 
         _validate_network(network)
@@ -365,6 +445,13 @@ class ApplicationSettingsStore:
             return default_settings(self.path.parent)
         except (OSError, json.JSONDecodeError) as exc:
             raise SettingsError("Cannot read application settings.") from exc
+        if (
+            isinstance(document, dict)
+            and document.get("version") == MIGRATABLE_SETTINGS_VERSION
+        ):
+            migrated = _decode_version_2_settings(document)
+            self._write_unlocked(migrated)
+            return migrated
         return _decode_settings(document)
 
     def _write_unlocked(self, settings: ApplicationSettings) -> None:
@@ -431,13 +518,16 @@ def _validate_wallet_name(wallet_name: str | None) -> None:
 
 
 def _validated_active_wallets(
-    values: Mapping[str, str | None],
-) -> dict[str, str | None]:
+    values: Mapping[str, ActiveWalletSelection],
+) -> dict[str, ActiveWalletSelection]:
     if not isinstance(values, Mapping) or set(values) != set(SUPPORTED_NETWORKS):
         raise SettingsValidationError("Invalid active wallet settings.")
     validated = dict(values)
-    for wallet_name in validated.values():
-        _validate_wallet_name(wallet_name)
+    if not all(
+        isinstance(selection, ActiveWalletSelection)
+        for selection in validated.values()
+    ):
+        raise SettingsValidationError("Invalid active wallet settings.")
     return validated
 
 
@@ -504,6 +594,54 @@ def _decode_settings(document: object) -> ApplicationSettings:
 
     active_wallets = _require_object(document["active_wallets"], "active wallets")
     _require_exact_keys(active_wallets, set(SUPPORTED_NETWORKS), "active wallets")
+    selections: dict[str, ActiveWalletSelection] = {}
+    for network_name in SUPPORTED_NETWORKS:
+        selection_document = _require_object(
+            active_wallets[network_name],
+            f"{network_name} active wallet",
+        )
+        _require_exact_keys(
+            selection_document,
+            {"wallet_name", "account_type"},
+            f"{network_name} active wallet",
+        )
+        selections[network_name] = ActiveWalletSelection(
+            wallet_name=selection_document["wallet_name"],
+            account_type=_decode_account_type(selection_document["account_type"]),
+        )
+
+    return _decode_shared_settings(document, selections)
+
+
+def _decode_version_2_settings(document: dict) -> ApplicationSettings:
+    """Validate and upgrade the one supported predecessor schema in memory."""
+
+    _require_exact_keys(
+        document,
+        {"version", "active_wallets", "general", "network", "storage"},
+        "Version 2 application settings",
+    )
+    if document["version"] != MIGRATABLE_SETTINGS_VERSION:
+        raise UnsupportedSettingsVersionError(
+            f"Unsupported settings version {document['version']!r}; "
+            f"Version {SETTINGS_VERSION} is required."
+        )
+    active_wallets = _require_object(document["active_wallets"], "active wallets")
+    _require_exact_keys(active_wallets, set(SUPPORTED_NETWORKS), "active wallets")
+    selections = {}
+    for network_name in SUPPORTED_NETWORKS:
+        wallet_name = active_wallets[network_name]
+        _validate_wallet_name(wallet_name)
+        selections[network_name] = ActiveWalletSelection(wallet_name)
+
+    return _decode_shared_settings(document, selections)
+
+
+def _decode_shared_settings(
+    document: dict,
+    active_wallets: Mapping[str, ActiveWalletSelection],
+) -> ApplicationSettings:
+    """Decode fields shared by the validated Version 2 and Version 3 schemas."""
 
     general_document = _require_object(document["general"], "general settings")
     _require_exact_keys(
@@ -554,7 +692,10 @@ def _encode_settings(settings: ApplicationSettings) -> dict:
     return {
         "version": SETTINGS_VERSION,
         "active_wallets": {
-            network: settings.active_wallets[network]
+            network: {
+                "wallet_name": settings.active_wallets[network].wallet_name,
+                "account_type": settings.active_wallets[network].account_type.value,
+            }
             for network in SUPPORTED_NETWORKS
         },
         "general": {
@@ -578,6 +719,20 @@ def _encode_settings(settings: ApplicationSettings) -> dict:
             )
         },
     }
+
+
+def _decode_account_type(value: object) -> AccountType:
+    if not isinstance(value, str):
+        raise SettingsValidationError("Invalid active wallet account type.")
+    try:
+        account_type = AccountType(value)
+    except ValueError as exc:
+        raise SettingsValidationError(
+            "Invalid active wallet account type."
+        ) from exc
+    if account_type not in SUPPORTED_ACCOUNT_TYPES:
+        raise SettingsValidationError("Unsupported active wallet account type.")
+    return account_type
 
 
 def _require_object(value: object, label: str) -> dict:

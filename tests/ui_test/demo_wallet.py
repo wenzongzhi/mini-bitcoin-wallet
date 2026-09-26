@@ -4,11 +4,13 @@ from dataclasses import replace
 from datetime import datetime, timezone
 
 from wallet_core.models import (
+    AccountType,
     BitcoinAmount,
     BroadcastResult,
     TransactionDirection,
     TransactionStatus,
     TransactionSummary,
+    WalletAccountActivation,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
@@ -22,13 +24,18 @@ class DemoWalletService(WalletService):
     """UI-safe demo data with the same contract as a real wallet backend."""
 
     ESTIMATED_TRANSACTION_VBYTES = 140
+    RECEIVE_ADDRESSES = {
+        AccountType.NATIVE_SEGWIT: "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        AccountType.LEGACY: "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
+    }
 
     def __init__(self) -> None:
         self._demo_draft = None
         self._snapshot = WalletSnapshot(
             name="Bitcoin Wallet",
             balance=BitcoinAmount(408_000),
-            receive_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            receive_address=self.RECEIVE_ADDRESSES[AccountType.NATIVE_SEGWIT],
+            account_type=AccountType.NATIVE_SEGWIT,
             authoritative_balance=BitcoinAmount(408_000),
             confirmed_balance=BitcoinAmount(408_000),
             unconfirmed_chain_balance=BitcoinAmount(0),
@@ -79,10 +86,32 @@ class DemoWalletService(WalletService):
     def select_wallet(self, name: str) -> WalletSnapshot:
         if name != self._snapshot.name:
             raise ValueError(f'Wallet "{name}" does not exist.')
+        self._snapshot = replace(
+            self._snapshot,
+            account_type=AccountType.NATIVE_SEGWIT,
+            receive_address=self.RECEIVE_ADDRESSES[AccountType.NATIVE_SEGWIT],
+        )
         return self._snapshot
 
+    def select_account_type(
+        self,
+        account_type: AccountType,
+    ) -> WalletAccountActivation:
+        try:
+            selected_type = AccountType(account_type)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Unsupported wallet account type.") from exc
+        self._snapshot = replace(
+            self._snapshot,
+            account_type=selected_type,
+            receive_address=self.RECEIVE_ADDRESSES[selected_type],
+        )
+        return WalletAccountActivation(self._snapshot, selected_type)
+
     def synchronize_wallet(self, name: str) -> WalletSnapshot:
-        return self.select_wallet(name)
+        if name != self._snapshot.name:
+            raise ValueError(f'Wallet "{name}" does not exist.')
+        return self._snapshot
 
     def transaction_status(self, txid: str) -> TransactionStatus:
         return TransactionStatus(txid=txid, confirmed=True, block_height=1)
@@ -118,7 +147,13 @@ class DemoWalletService(WalletService):
         return self._snapshot
 
     def create_wallet(self, name: str, password: str) -> WalletCreation:
-        self._snapshot = replace(self._snapshot, name=name, is_initialized=True)
+        self._snapshot = replace(
+            self._snapshot,
+            name=name,
+            receive_address=self.RECEIVE_ADDRESSES[AccountType.NATIVE_SEGWIT],
+            account_type=AccountType.NATIVE_SEGWIT,
+            is_initialized=True,
+        )
         return WalletCreation(self._snapshot, "demo mnemonic")
 
     def import_wallet(
@@ -127,7 +162,13 @@ class DemoWalletService(WalletService):
         password: str,
         mnemonic: str,
     ) -> WalletCreation:
-        self._snapshot = replace(self._snapshot, name=name, is_initialized=True)
+        self._snapshot = replace(
+            self._snapshot,
+            name=name,
+            receive_address=self.RECEIVE_ADDRESSES[AccountType.NATIVE_SEGWIT],
+            account_type=AccountType.NATIVE_SEGWIT,
+            is_initialized=True,
+        )
         return WalletCreation(self._snapshot, generated_mnemonic=None)
 
     def prepare_withdrawal(
@@ -150,6 +191,7 @@ class DemoWalletService(WalletService):
             fee,
             fee_rate_sat_vb,
             send_all,
+            self._snapshot.account_type,
         )
         return WithdrawalDraft(
             draft_id="demo-review",
@@ -160,6 +202,7 @@ class DemoWalletService(WalletService):
             estimated_fee=fee,
             fee_rate_sat_vb=fee_rate_sat_vb,
             send_all=send_all,
+            account_type=self._snapshot.account_type,
         )
 
     def _fund_withdrawal(
@@ -194,7 +237,14 @@ class DemoWalletService(WalletService):
     ) -> WithdrawalReview:
         if draft_id != "demo-review" or self._demo_draft is None:
             raise ValueError("Withdrawal draft does not exist.")
-        destination, amount, fee, fee_rate_sat_vb, send_all = self._demo_draft
+        (
+            destination,
+            amount,
+            fee,
+            fee_rate_sat_vb,
+            send_all,
+            account_type,
+        ) = self._demo_draft
         return WithdrawalReview(
             review_id=draft_id,
             wallet_name=self._snapshot.name,
@@ -205,6 +255,7 @@ class DemoWalletService(WalletService):
             fee=fee,
             fee_rate_sat_vb=fee_rate_sat_vb,
             send_all=send_all,
+            account_type=account_type,
         )
 
     def broadcast_withdrawal(self, review_id: str) -> BroadcastResult:

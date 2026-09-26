@@ -8,9 +8,11 @@ import tkinter as tk
 
 from app_settings import ApplicationSettingsStore, GeneralSettings
 from wallet_core import (
+    AccountType,
     BitcoinAmount,
     DisplayUnit,
     WalletApplication,
+    WalletAccountActivation,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
@@ -131,6 +133,12 @@ class WalletUIState:
         )
 
     @property
+    def active_account_type(self) -> AccountType:
+        """Return the account whose receive address and UTXOs are active."""
+
+        return self._snapshot.account_type
+
+    @property
     def unit(self) -> DisplayUnit:
         return DisplayUnit(self.display_unit.get())
 
@@ -209,6 +217,20 @@ class WalletUIState:
         self._apply_snapshot(snapshot)
         self._announce("<<ActiveWalletChanged>>")
 
+    def apply_account_activation(
+        self,
+        activation: WalletAccountActivation,
+    ) -> None:
+        """Apply a worker result and request the normal all-account sync."""
+
+        # Changing account type changes the UTXO pool used by Withdrawal. Do
+        # not leave a form populated for the previously selected account.
+        self.amount.set("")
+        self.address.set("")
+        self.send_all.set(False)
+        self._apply_snapshot(activation.snapshot)
+        self._announce("<<ActiveWalletChanged>>")
+
     def reload_wallet(self) -> None:
         """Reload the active wallet from the Platform-backed adapter."""
 
@@ -222,9 +244,12 @@ class WalletUIState:
         self.revision.set(self.revision.get() + 1)
 
     def apply_synchronized_snapshot(self, snapshot) -> bool:
-        """Apply a background result only if its wallet is still active."""
+        """Reject stale results from a wallet or account no longer active."""
 
-        if snapshot.name != self.active_wallet_name:
+        if (
+            snapshot.name != self.active_wallet_name
+            or snapshot.account_type is not self.active_account_type
+        ):
             return False
         self._apply_snapshot(snapshot)
         return True

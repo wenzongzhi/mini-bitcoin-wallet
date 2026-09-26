@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import tkinter as tk
+from unittest.mock import Mock
 
 import pytest
 
@@ -17,7 +18,12 @@ from theme import (
     palette_for_mode,
     resolve_theme_mode,
 )
-from wallet_core import BitcoinAmount, DisplayUnit
+from wallet_core import (
+    AccountType,
+    BitcoinAmount,
+    DisplayUnit,
+    WalletAccountActivation,
+)
 
 
 def test_confirmation_monitoring_uses_only_locally_broadcast_pending_txids() -> None:
@@ -74,6 +80,43 @@ def test_withdrawal_input_unit_is_separate_from_display_preference() -> None:
 
     assert state.unit is DisplayUnit.BTC
     assert state.withdrawal_amount_unit is DisplayUnit.SATS
+
+
+def test_account_switch_clears_withdrawal_form_before_publishing_snapshot() -> None:
+    state = object.__new__(WalletUIState)
+    state.amount = SimpleNamespace(set=Mock())
+    state.address = SimpleNamespace(set=Mock())
+    state.send_all = SimpleNamespace(set=Mock())
+    state._apply_snapshot = Mock()
+    state._announce = Mock()
+    snapshot = SimpleNamespace(account_type=AccountType.LEGACY)
+
+    state.apply_account_activation(
+        WalletAccountActivation(snapshot, AccountType.LEGACY)
+    )
+
+    state.amount.set.assert_called_once_with("")
+    state.address.set.assert_called_once_with("")
+    state.send_all.set.assert_called_once_with(False)
+    state._apply_snapshot.assert_called_once_with(snapshot)
+    state._announce.assert_called_once_with("<<ActiveWalletChanged>>")
+
+
+def test_background_sync_from_previous_account_is_rejected() -> None:
+    state = object.__new__(WalletUIState)
+    state._snapshot = SimpleNamespace(
+        name="Wallet",
+        is_initialized=True,
+        account_type=AccountType.LEGACY,
+    )
+    state._apply_snapshot = Mock()
+    stale_native_snapshot = SimpleNamespace(
+        name="Wallet",
+        account_type=AccountType.NATIVE_SEGWIT,
+    )
+
+    assert state.apply_synchronized_snapshot(stale_native_snapshot) is False
+    state._apply_snapshot.assert_not_called()
 
 
 def test_hidden_balance_also_masks_fiat_presentation() -> None:

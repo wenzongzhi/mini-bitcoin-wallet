@@ -37,6 +37,7 @@ class PaymentDraft:
     estimated_fee_sats: int
     fee_rate_sat_vb: int
     send_all: bool
+    address_type: str = "p2wpkh"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +51,7 @@ class SignedPayment:
     fee_sats: int
     fee_rate_sat_vb: int
     send_all: bool
+    address_type: str = "p2wpkh"
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,9 +99,11 @@ class PaymentService:
         fee_rate_sat_vb: int,
         *,
         send_all: bool = False,
+        address_type: str | None = None,
     ) -> PaymentDraft:
         """Validate, refresh spendable state, and reserve funded inputs."""
 
+        selected_type = self.wallet_service.resolve_address_type(address_type)
         if not destination:
             raise TransactionError("destination address is required")
         if isinstance(fee_rate_sat_vb, bool) or fee_rate_sat_vb <= 0:
@@ -122,6 +126,7 @@ class PaymentService:
                 self.wallet_service.sync_wallet(
                     wallet_name,
                     include_transactions=False,
+                    address_type=selected_type,
                 )
                 if send_all:
                     funded = fund_all_transaction(
@@ -129,7 +134,7 @@ class PaymentService:
                         wallet_name,
                         self.wallet_service.cache_file,
                         self.wallet_service.network,
-                        self.wallet_service.address_type,
+                        selected_type,
                         fee_rate_sat_vb,
                         utxo_source="fresh backend synchronization",
                     )
@@ -145,7 +150,7 @@ class PaymentService:
                         self.wallet_service.wallet_file,
                         self.wallet_service.cache_file,
                         self.wallet_service.network,
-                        self.wallet_service.address_type,
+                        selected_type,
                         fee_rate_sat_vb,
                         utxo_source="fresh backend synchronization",
                     )
@@ -165,6 +170,7 @@ class PaymentService:
                 "destination": destination,
                 "fee_rate_sat_vb": fee_rate_sat_vb,
                 "send_all": send_all,
+                "address_type": selected_type,
             }
             return PaymentDraft(
                 draft_id,
@@ -175,6 +181,7 @@ class PaymentService:
                 funded["estimated_fee_sats"],
                 fee_rate_sat_vb,
                 send_all,
+                selected_type,
             )
 
     def sign(self, draft_id: str, password: str | None) -> SignedPayment:
@@ -216,6 +223,7 @@ class PaymentService:
                 signed["fee_sats"],
                 prepared["fee_rate_sat_vb"],
                 prepared["send_all"],
+                prepared["address_type"],
             )
 
     def broadcast(self, payment_id: str) -> BroadcastReceipt:

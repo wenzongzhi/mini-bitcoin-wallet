@@ -9,7 +9,7 @@ from btc.chainparams import NETWORK_TESTNET4
 from explorer_links import transaction_explorer_url
 from tests.ui_test.demo_wallet import DemoWalletService
 from tx.codec import deserialize_transaction_hex, transaction_txid
-from wallet_core import BitcoinAmount, DisplayUnit, WalletApplication
+from wallet_core import AccountType, BitcoinAmount, DisplayUnit, WalletApplication
 from wallet import get_new_address, get_wallet_address_book
 
 
@@ -275,6 +275,155 @@ class BitcoinToolWalletServiceTests(TestCase):
         )
 
         self.assertEqual(restarted.snapshot().name, "Wallet_B")
+
+    def test_legacy_account_selection_persists_across_service_restart(self):
+        backend = FakeEsploraBackend()
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "account-cache.json",
+            settings_store=self.settings_store,
+            backend_factory=lambda _network: backend,
+        )
+        service.create_wallet("AccountWallet", "password")
+
+        activation = service.select_account_type(AccountType.LEGACY)
+        restarted = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "account-cache.json",
+            settings_store=self.settings_store,
+            backend_factory=lambda _network: backend,
+        )
+
+        self.assertIs(activation.account_type, AccountType.LEGACY)
+        self.assertIsNotNone(activation.discovery)
+        self.assertTrue(activation.snapshot.receive_address.startswith("1"))
+        self.assertIs(
+            self.settings_store.active_account_type("mainnet"),
+            AccountType.LEGACY,
+        )
+        self.assertIs(restarted.snapshot().account_type, AccountType.LEGACY)
+        self.assertEqual(
+            restarted.snapshot().receive_address,
+            activation.snapshot.receive_address,
+        )
+
+    def test_failed_legacy_discovery_does_not_change_active_account(self):
+        class OfflineDiscoveryBackend(FakeEsploraBackend):
+            def get_address(self, address):
+                raise OSError("backend offline")
+
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "offline-account-cache.json",
+            settings_store=self.settings_store,
+            backend_factory=lambda network: OfflineDiscoveryBackend(network),
+        )
+        service.create_wallet("NativeWallet", "password")
+        settings_before = self.settings_store.path.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "discovery failed"):
+            service.select_account_type(AccountType.LEGACY)
+
+        self.assertEqual(self.settings_store.path.read_bytes(), settings_before)
+        self.assertIs(service.snapshot().account_type, AccountType.NATIVE_SEGWIT)
+        self.assertTrue(service.snapshot().receive_address.startswith("bc1q"))
+
+    def test_newly_selected_wallet_resets_to_native_segwit(self):
+        backend = FakeEsploraBackend()
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "wallet-switch-cache.json",
+            settings_store=self.settings_store,
+            backend_factory=lambda _network: backend,
+        )
+        service.create_wallet("Wallet_A", "password-a")
+        service.select_account_type(AccountType.LEGACY)
+        created = service.create_wallet("Wallet_B", "password-b")
+        reopened = service.select_wallet("Wallet_A")
+
+        self.assertIs(created.snapshot.account_type, AccountType.NATIVE_SEGWIT)
+        self.assertIs(reopened.account_type, AccountType.NATIVE_SEGWIT)
+        self.assertTrue(reopened.receive_address.startswith("bc1q"))
+
+    def test_rename_preserves_active_legacy_account(self):
+        backend = FakeEsploraBackend()
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "rename-account-cache.json",
+            settings_store=self.settings_store,
+            backend_factory=lambda _network: backend,
+        )
+        service.create_wallet("Before", "password")
+        legacy = service.select_account_type(AccountType.LEGACY)
+
+        renamed = service.rename_wallet("After", "password")
+
+        self.assertEqual(renamed.name, "After")
+        self.assertIs(renamed.account_type, AccountType.LEGACY)
+        self.assertEqual(renamed.receive_address, legacy.snapshot.receive_address)
+        selection = self.settings_store.active_wallet_selection("mainnet")
+        self.assertEqual(selection.wallet_name, "After")
+        self.assertIs(selection.account_type, AccountType.LEGACY)
+
+    def test_sync_aggregates_native_and_legacy_but_keeps_legacy_deposit(self):
+        backend = FakeEsploraBackend()
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "aggregate-account-cache.json",
+            settings_store=self.settings_store,
+            backend_factory=lambda _network: backend,
+        )
+        native = service.create_wallet("Aggregate", "password").snapshot
+        legacy = service.select_account_type(AccountType.LEGACY).snapshot
+        self.assertEqual(len(backend._address_ordinals), 40)
+        backend.funded_ordinals.update({0: 30_000, 40: 70_000})
+
+        synchronized = service.synchronize_wallet("Aggregate")
+
+        self.assertEqual(synchronized.balance.sats, 100_000)
+        self.assertEqual(synchronized.authoritative_balance.sats, 100_000)
+        self.assertIs(synchronized.account_type, AccountType.LEGACY)
+        self.assertTrue(synchronized.receive_address.startswith("1"))
+        self.assertNotEqual(synchronized.receive_address, legacy.receive_address)
+        self.assertNotEqual(synchronized.receive_address, native.receive_address)
+        self.assertEqual(
+            {summary.address_types for summary in synchronized.transactions},
+            {("P2PKH",), ("P2WPKH",)},
+        )
+
+    def test_legacy_max_withdrawal_uses_only_legacy_utxos(self):
+        backend = FakeEsploraBackend()
+        cache_file = self.wallet_file.parent / "legacy-max-cache.json"
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            cache_file,
+            settings_store=self.settings_store,
+            backend_factory=lambda _network: backend,
+        )
+        native = service.create_wallet("LegacyMax", "password").snapshot
+        service.select_account_type(AccountType.LEGACY)
+        backend.funded_ordinals.update({0: 50_000, 40: 90_000})
+
+        draft = service.prepare_withdrawal(
+            native.receive_address,
+            None,
+            2,
+            send_all=True,
+        )
+
+        self.assertIs(draft.account_type, AccountType.LEGACY)
+        self.assertEqual(draft.amount.sats + draft.estimated_fee.sats, 50_000)
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))["wallets"][
+            "LegacyMax"
+        ]
+        reserved = set(cache["reserved_outpoints"])
+        selected = [
+            utxo
+            for utxo in cache["utxos"]
+            if f'{utxo["txid"]}:{utxo["vout"]}' in reserved
+        ]
+        self.assertEqual({utxo["address_type"] for utxo in selected}, {"P2PKH"})
+        service.cancel_withdrawal(draft.draft_id)
 
     def test_missing_active_wallet_falls_back_to_first_wallet(self):
         self.service.create_wallet("Wallet_A", "password-a")

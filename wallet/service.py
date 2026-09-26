@@ -34,6 +34,7 @@ from .wallet import (
     _derive_key,
     _load_wallets,
     _locked_wallet_file,
+    _normalize_address_type,
     _read_mnemonic,
     _require_current_wallet,
     _save_wallets,
@@ -122,6 +123,15 @@ class WalletCreationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class WalletAccountEnablement:
+    """Result of making one deterministic wallet account available to a client."""
+
+    address_type: str
+    state: WalletState
+    discovery: WalletDiscovery | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TransactionStatus:
     txid: str
     confirmed: bool
@@ -161,7 +171,9 @@ class WalletService:
         self.wallet_file = Path(wallet_file)
         self.cache_file = Path(cache_file)
         self.network = network
-        self.address_type = address_type
+        if not isinstance(address_type, str):
+            raise WalletError("wallet account address type must be a string")
+        self.address_type = _normalize_address_type(address_type)
         self.gap_limit = gap_limit
         self.import_scan_size = gap_limit
         self.discovery_max_addresses = discovery_max_addresses
@@ -198,9 +210,16 @@ class WalletService:
             )
         return tuple(wallets)
 
-    def create_wallet(self, name: str, password: str | None) -> WalletCreationResult:
+    def create_wallet(
+        self,
+        name: str,
+        password: str | None,
+        *,
+        address_type: str | None = None,
+    ) -> WalletCreationResult:
         """Create a generated wallet and issue its first receive address."""
 
+        selected_type = self.resolve_address_type(address_type)
         with self.operation_lock:
             mnemonic = mnemonic_from_entropy_hex(secrets.token_hex(32))
             create_wallet_record(
@@ -217,13 +236,14 @@ class WalletService:
             get_new_address(
                 name,
                 wallet_file=self.wallet_file,
-                address_type=self.address_type,
+                address_type=selected_type,
                 network=self.network,
             )
             state = self._state_after_cache_maintenance(
                 name,
                 cache_usable,
                 f'wallet "{name}" was created but its cache state is invalid',
+                address_type=selected_type,
             )
             return WalletCreationResult(state, mnemonic)
 
@@ -232,9 +252,12 @@ class WalletService:
         name: str,
         password: str | None,
         mnemonic: str,
+        *,
+        address_type: str | None = None,
     ) -> WalletCreationResult:
         """Import, discover, and sync with rollback on caught failures."""
 
+        selected_type = self.resolve_address_type(address_type)
         normalized_mnemonic = normalize_mnemonic(mnemonic)
         _validate_mnemonic(normalized_mnemonic)
         with self.operation_lock:
@@ -249,8 +272,8 @@ class WalletService:
             record_created = True
             try:
                 self._remove_cache_entry(name)
-                discovery = self._discover_imported_wallet(name)
-                state = self.sync_wallet(name)
+                discovery = self._discover_imported_wallet(name, selected_type)
+                state = self.sync_wallet(name, address_type=selected_type)
             except Exception as import_error:
                 safe_error = _redact_recovery_words(
                     str(import_error),
@@ -271,9 +294,23 @@ class WalletService:
                 ) from None
             return WalletCreationResult(state, None, discovery)
 
-    def _discover_imported_wallet(self, name: str) -> WalletDiscovery:
-        """Discover address history cheaply, then persist both branches once."""
+    def _discover_imported_wallet(
+        self,
+        name: str,
+        address_type: str | None = None,
+    ) -> WalletDiscovery:
+        """Import-specific hook around deterministic account discovery."""
 
+        return self._discover_account_addresses(name, address_type)
+
+    def _discover_account_addresses(
+        self,
+        name: str,
+        address_type: str | None = None,
+    ) -> WalletDiscovery:
+        """Discover account history cheaply, then persist both branches once."""
+
+        selected_type = self.resolve_address_type(address_type)
         backend = self.backend_factory(self.network)
         if getattr(backend, "network", None) != self.network:
             raise WalletError("wallet discovery backend network does not match wallet")
@@ -281,18 +318,20 @@ class WalletService:
             name,
             BTC_RECEIVE_BRANCH,
             backend,
+            selected_type,
         )
         change, change_usage = self._discover_branch(
             name,
             BTC_CHANGE_BRANCH,
             backend,
+            selected_type,
         )
         commit_discovered_addresses(
             name,
             receive_usage,
             change_usage,
             wallet_file=self.wallet_file,
-            address_type=self.address_type,
+            address_type=selected_type,
             network=self.network,
         )
         return WalletDiscovery(receive, change)
@@ -302,9 +341,11 @@ class WalletService:
         name: str,
         branch: int,
         backend,
+        address_type: str | None = None,
     ) -> tuple[BranchDiscovery, dict[int, bool]]:
         """Find the last-used index using address statistics only."""
 
+        selected_type = self.resolve_address_type(address_type)
         usage: dict[int, bool] = {}
         consecutive_unused = 0
         index = 0
@@ -320,7 +361,7 @@ class WalletService:
                 index,
                 wallet_file=self.wallet_file,
                 change=branch == BTC_CHANGE_BRANCH,
-                address_type=self.address_type,
+                address_type=selected_type,
                 network=self.network,
             )
             try:
@@ -341,11 +382,48 @@ class WalletService:
         }
         return BranchDiscovery(branch, index, used_indexes), committed_usage
 
-    def get_wallet_state(self, name: str) -> WalletState:
-        """Return display-neutral state from wallet metadata and public cache."""
+    def enable_account(
+        self,
+        name: str,
+        address_type: str,
+    ) -> WalletAccountEnablement:
+        """Discover an empty account once and return its cached wallet state.
 
+        Account activation is a product preference, so the Platform does not
+        persist it.  A non-empty address book proves that the account was
+        already enabled and makes this operation idempotent.  Full wallet
+        synchronization remains a separate operation.
+        """
+
+        selected_type = self.resolve_address_type(address_type)
+        self._metadata(name)
+        with self.operation_lock:
+            address_book = get_wallet_address_book(
+                name,
+                wallet_file=self.wallet_file,
+                address_type=selected_type,
+                network=self.network,
+            )
+            discovery = None
+            if not address_book["addresses"]:
+                discovery = self._discover_account_addresses(name, selected_type)
+            state = self.get_wallet_state(name, address_type=selected_type)
+        return WalletAccountEnablement(selected_type, state, discovery)
+
+    def get_wallet_state(
+        self,
+        name: str,
+        *,
+        address_type: str | None = None,
+    ) -> WalletState:
+        """Return aggregate cached accounting plus one account's receive address."""
+
+        selected_type = self.resolve_address_type(address_type)
         metadata = self._metadata(name)
-        receive_address = self.get_receive_address(name)
+        receive_address = self.get_receive_address(
+            name,
+            address_type=selected_type,
+        )
         if not self.cache_file.exists():
             return self._empty_wallet_state(metadata, receive_address)
         with locked_cache_file(self.cache_file):
@@ -394,14 +472,20 @@ class WalletService:
             pending_txids,
         )
 
-    def get_receive_address(self, name: str) -> str:
+    def get_receive_address(
+        self,
+        name: str,
+        *,
+        address_type: str | None = None,
+    ) -> str:
         """Return index zero or the first receive address after the last used one."""
 
+        selected_type = self.resolve_address_type(address_type)
         self._metadata(name)
         address_book = get_wallet_address_book(
             name,
             wallet_file=self.wallet_file,
-            address_type=self.address_type,
+            address_type=selected_type,
             network=self.network,
         )
         receive_entries = [
@@ -411,7 +495,7 @@ class WalletService:
             return get_new_address(
                 name,
                 wallet_file=self.wallet_file,
-                address_type=self.address_type,
+                address_type=selected_type,
                 network=self.network,
             )["address"]
         target_index = self._next_receive_index(receive_entries)
@@ -426,7 +510,7 @@ class WalletService:
             created = get_new_address(
                 name,
                 wallet_file=self.wallet_file,
-                address_type=self.address_type,
+                address_type=selected_type,
                 network=self.network,
             )
             highest_index = created["index"]
@@ -439,9 +523,16 @@ class WalletService:
         name: str,
         *,
         include_transactions: bool = True,
+        address_type: str | None = None,
     ) -> WalletState:
-        """Synchronize a wallet while preserving history on UTXO-only scans."""
+        """Synchronize all issued accounts and return one account's receive view.
 
+        ``address_type`` selects only the receive address in the returned state;
+        balances, transactions, and UTXOs remain aggregated across every issued
+        account. UTXO-only scans preserve the previously cached history.
+        """
+
+        selected_type = self.resolve_address_type(address_type)
         self._metadata(name)
         with self.operation_lock:
             self._discard_stale_cache_entry(name)
@@ -458,7 +549,7 @@ class WalletService:
             )
             if cached_history is not None:
                 self._restore_cached_history(name, cached_history)
-            return self.get_wallet_state(name)
+            return self.get_wallet_state(name, address_type=selected_type)
 
     def get_mnemonic(self, name: str, password: str | None) -> str:
         return read_wallet_mnemonic(
@@ -473,12 +564,15 @@ class WalletService:
         name: str,
         new_name: str,
         password: str | None,
+        *,
+        address_type: str | None = None,
     ) -> WalletState:
         """Rename authoritative wallet data, then best-effort migrate its cache."""
 
+        selected_type = self.resolve_address_type(address_type)
         _validate_wallet_name(new_name)
         if new_name == name:
-            return self.get_wallet_state(name)
+            return self.get_wallet_state(name, address_type=selected_type)
         with self.operation_lock:
             with _locked_wallet_file(self.wallet_file):
                 wallets = _load_wallets(self.wallet_file)
@@ -506,6 +600,7 @@ class WalletService:
             new_name,
             cache_usable,
             f'wallet "{new_name}" was renamed but its cache state is invalid',
+            address_type=selected_type,
         )
 
     def change_password(
@@ -513,9 +608,12 @@ class WalletService:
         name: str,
         current_password: str | None,
         new_password: str | None,
+        *,
+        address_type: str | None = None,
     ) -> WalletState:
         """Re-encrypt the mnemonic while preserving all deterministic state."""
 
+        selected_type = self.resolve_address_type(address_type)
         if new_password == "":
             raise WalletError("new password must not be empty")
         with self.operation_lock, _locked_wallet_file(self.wallet_file):
@@ -538,7 +636,7 @@ class WalletService:
                 updated.pop("mnemonic", None)
             wallets[name] = updated
             _save_wallets(wallets, self.wallet_file)
-        return self.get_wallet_state(name)
+        return self.get_wallet_state(name, address_type=selected_type)
 
     def remove_wallet(self, name: str, password: str | None) -> None:
         """Remove authoritative wallet data, then best-effort discard its cache."""
@@ -580,6 +678,14 @@ class WalletService:
         if isinstance(block_height, bool) or not isinstance(block_height, int):
             block_height = None
         return TransactionStatus(txid, confirmed, block_height, block_time)
+
+    def resolve_address_type(self, address_type: str | None = None) -> str:
+        """Return one canonical account type without mutating service context."""
+
+        selected_type = self.address_type if address_type is None else address_type
+        if not isinstance(selected_type, str):
+            raise WalletError("wallet account address type must be a string")
+        return _normalize_address_type(selected_type)
 
     def _metadata(self, name: str) -> WalletMetadata:
         match = next((wallet for wallet in self.list_wallets() if wallet.name == name), None)
@@ -715,11 +821,19 @@ class WalletService:
             )
             return False
 
-    def _state_without_cache(self, name: str) -> WalletState:
+    def _state_without_cache(
+        self,
+        name: str,
+        *,
+        address_type: str | None = None,
+    ) -> WalletState:
         """Return authoritative identity/address state without reading cache."""
 
         metadata = self._metadata(name)
-        receive_address = self.get_receive_address(name)
+        receive_address = self.get_receive_address(
+            name,
+            address_type=address_type,
+        )
         return self._empty_wallet_state(metadata, receive_address)
 
     def _state_after_cache_maintenance(
@@ -727,12 +841,14 @@ class WalletService:
         name: str,
         cache_usable: bool,
         warning_message: str,
+        *,
+        address_type: str | None = None,
     ) -> WalletState:
         """Return lifecycle success even when its derived cache is unusable."""
 
         if cache_usable:
             try:
-                return self.get_wallet_state(name)
+                return self.get_wallet_state(name, address_type=address_type)
             except WalletError as cache_error:
                 warnings.warn(
                     f"{warning_message}; it will be rebuilt by synchronization: "
@@ -740,7 +856,7 @@ class WalletService:
                     WalletCacheWarning,
                     stacklevel=2,
                 )
-        return self._state_without_cache(name)
+        return self._state_without_cache(name, address_type=address_type)
 
     @staticmethod
     def _empty_wallet_state(
@@ -776,7 +892,6 @@ class WalletService:
         address_book = get_wallet_address_book(
             name,
             wallet_file=self.wallet_file,
-            address_type=self.address_type,
             network=self.network,
         )
         return {

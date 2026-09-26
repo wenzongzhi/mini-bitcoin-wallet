@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from .models import (
+    AccountType,
     BitcoinAmount,
     BroadcastResult,
     DisplayUnit,
     TransactionStatus,
+    WalletAccountActivation,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
@@ -33,6 +35,18 @@ class WalletApplication:
         if not normalized:
             raise ValueError("Wallet name cannot be empty.")
         return self._service.select_wallet(normalized)
+
+    def select_account_type(
+        self,
+        account_type: AccountType,
+    ) -> WalletAccountActivation:
+        """Enable and select one of the account types supported by the UI."""
+
+        try:
+            selected_type = AccountType(account_type)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Unsupported wallet account type.") from exc
+        return self._service.select_account_type(selected_type)
 
     def synchronize_wallet(self, name: str) -> WalletSnapshot:
         normalized = name.strip()

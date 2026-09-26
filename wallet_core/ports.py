@@ -5,9 +5,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 from .models import (
+    AccountType,
     BitcoinAmount,
     BroadcastResult,
     TransactionStatus,
+    WalletAccountActivation,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
@@ -19,8 +21,8 @@ from .models import (
 class WalletService(ABC):
     """Capability contract implemented by demo and production backends.
 
-    A future bitcoin-tool adapter belongs behind this interface.  Pages must
-    never import transaction builders, storage code, or network clients.
+    Concrete Platform and demo adapters belong behind this interface. Pages
+    must never import transaction builders, storage code, or network clients.
     """
 
     @abstractmethod
@@ -34,6 +36,13 @@ class WalletService(ABC):
     @abstractmethod
     def select_wallet(self, name: str) -> WalletSnapshot:
         """Persist and load the active wallet without decrypting it."""
+
+    @abstractmethod
+    def select_account_type(
+        self,
+        account_type: AccountType,
+    ) -> WalletAccountActivation:
+        """Enable and select an account type for the active wallet."""
 
     @abstractmethod
     def synchronize_wallet(self, name: str) -> WalletSnapshot:

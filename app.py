@@ -177,9 +177,9 @@ def create_settings_store(
 ) -> ApplicationSettingsStore:
     """Create the one shared settings store used by the desktop application.
 
-    Legacy wallet discovery runs only while the Version 2 settings file is
-    first created. It selects the old directory by reference and never reads,
-    copies, moves, or deletes wallet contents.
+    Legacy wallet discovery runs only while the settings file is first created.
+    It selects the old directory by reference and never reads, copies, moves,
+    or deletes wallet contents.
     """
 
     store = ApplicationSettingsStore(settings_path)

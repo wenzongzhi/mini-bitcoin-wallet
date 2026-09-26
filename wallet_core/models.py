@@ -22,6 +22,13 @@ class TransactionDirection(str, Enum):
     SELF = "self"
 
 
+class AccountType(str, Enum):
+    """Bitcoin account types currently enabled by the Mini Wallet product."""
+
+    NATIVE_SEGWIT = "p2wpkh"
+    LEGACY = "p2pkh"
+
+
 @dataclass(frozen=True, slots=True)
 class BitcoinAmount:
     """A Bitcoin amount stored exactly as satoshis."""
@@ -102,11 +109,14 @@ class AddressDiscoverySummary:
 @dataclass(frozen=True, slots=True)
 class WalletSnapshot:
     name: str
-    # `balance` is the effective amount shown by the UI. The remaining fields
-    # retain the platform's accounting distinctions for future screens and
-    # prevent callers from treating pending funds as immediately spendable.
+    # `balance` is the effective aggregate amount shown by the UI. `account_type`
+    # selects the receive address and withdrawal UTXO pool; the accounting and
+    # transaction fields still cover every issued account. The remaining
+    # balances retain the Platform distinctions that prevent callers from
+    # treating pending funds as immediately spendable.
     balance: BitcoinAmount
     receive_address: str
+    account_type: AccountType = AccountType.NATIVE_SEGWIT
     authoritative_balance: BitcoinAmount = BitcoinAmount(0)
     confirmed_balance: BitcoinAmount = BitcoinAmount(0)
     unconfirmed_chain_balance: BitcoinAmount = BitcoinAmount(0)
@@ -134,6 +144,15 @@ class WalletCreation:
 
 
 @dataclass(frozen=True, slots=True)
+class WalletAccountActivation:
+    """Result of enabling and selecting one account within the active wallet."""
+
+    snapshot: WalletSnapshot
+    account_type: AccountType
+    discovery: AddressDiscoverySummary | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class WithdrawalDraft:
     """Funded transaction values validated before the wallet is unlocked."""
 
@@ -145,6 +164,7 @@ class WithdrawalDraft:
     estimated_fee: BitcoinAmount
     fee_rate_sat_vb: int
     send_all: bool
+    account_type: AccountType = AccountType.NATIVE_SEGWIT
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +180,7 @@ class WithdrawalReview:
     fee: BitcoinAmount
     fee_rate_sat_vb: int
     send_all: bool
+    account_type: AccountType = AccountType.NATIVE_SEGWIT
 
     @property
     def total(self) -> BitcoinAmount:

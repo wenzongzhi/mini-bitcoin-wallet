@@ -50,6 +50,17 @@ file directly.
 - Multiple wallets can be listed and switched without entering a password. The
   active wallet for each network is remembered in non-secret application
   settings.
+- New and imported wallets start with the Native SegWit account (BIP84). Wallet
+  Settings can switch the active account to Legacy (BIP44); Nested SegWit and
+  Taproot are visible as future options but cannot yet be selected.
+- When the BIP44 address book is still empty, the first Legacy selection
+  performs gap-limit discovery for both receive and change branches. Later
+  synchronization scans every account that has been enabled. Home shows their
+  aggregate balance and history, while Deposit and Withdrawal use only the
+  currently selected account type.
+- Account selection is remembered independently for Mainnet and Testnet4.
+  Selecting a different wallet resets its account type to Native SegWit;
+  renaming the active wallet preserves its current account type.
 - Wallet Settings can display recovery words, rename a wallet, replace its
   password, or remove it after ownership confirmation.
 - Imported wallets discover receive and change history independently until each
@@ -99,18 +110,22 @@ The Settings dialog contains only General, Network, and Storage:
   Storage changes take effect after restart; cache paths remain
   Platform-managed.
 
-`settings.json` uses the strict Version 2 schema and is stored in Mini Bitcoin
-Wallet's stable `platformdirs` configuration directory. New installations keep
-`wallets.json`, `wallet_cache.json`, `wallets_testnet4.json`, and
-`wallet_cache_testnet4.json` in that same directory. Settings contains no
-mnemonic, password, private key, or wallet JSON. Unknown/old settings versions
-are rejected rather than guessed or migrated.
+`settings.json` uses a strict schema and is stored in Mini Bitcoin Wallet's
+stable `platformdirs` configuration directory. Each network stores one complete
+active selection: `wallet_name` plus `account_type` (`p2wpkh` or `p2pkh`). A
+valid settings file from the immediately previous schema is upgraded atomically
+with Native SegWit selected; malformed or unsupported schemas are rejected
+without rewriting the source file.
 
-On the first Version 2 launch, existing data is protected using this directory
-priority: Mini Bitcoin Wallet default, bitcoin-tool default, then the older
-source/EXE directory. Both networks are checked. The chosen directory is only
-referenced; wallet files are never moved, copied, merged, or deleted
-automatically.
+New installations keep `wallets.json`, `wallet_cache.json`,
+`wallets_testnet4.json`, and `wallet_cache_testnet4.json` in that same
+directory. Settings contains no mnemonic, password, private key, or wallet
+JSON.
+
+On first launch, existing data is protected using this directory priority: Mini
+Bitcoin Wallet default, bitcoin-tool default, then the older source/EXE
+directory. Both networks are checked. The chosen directory is only referenced;
+wallet files are never moved, copied, merged, or deleted automatically.
 
 Mnemonic discovery queries a public Esplora service and may reveal scanned
 addresses to that service.

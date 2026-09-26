@@ -7,6 +7,7 @@ service without changing the pages.
 
 from .application import WalletApplication
 from .models import (
+    AccountType,
     AddressDiscoverySummary,
     BitcoinAmount,
     BroadcastResult,
@@ -14,6 +15,7 @@ from .models import (
     TransactionStatus,
     TransactionDirection,
     TransactionSummary,
+    WalletAccountActivation,
     WalletCreation,
     WalletSnapshot,
     WalletSummary,
@@ -23,6 +25,7 @@ from .models import (
 from .ports import WalletService
 
 __all__ = [
+    "AccountType",
     "AddressDiscoverySummary",
     "BitcoinAmount",
     "BroadcastResult",
@@ -30,6 +33,7 @@ __all__ = [
     "TransactionStatus",
     "TransactionDirection",
     "TransactionSummary",
+    "WalletAccountActivation",
     "WalletApplication",
     "WalletCreation",
     "WalletService",
