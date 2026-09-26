@@ -137,7 +137,9 @@ class WalletSettingsDialog(tk.Toplevel):
             parent,
             minimum_width=430,
             minimum_height=650,
-            initial_focus=self.account_buttons[0],
+            # Focus the dialog itself on open. Keyboard users can still Tab to
+            # the radio group, but mouse users do not see a focus decoration.
+            initial_focus=self,
         )
 
     def _build_account_type_section(self, panel: tk.Misc) -> None:
@@ -160,9 +162,14 @@ class WalletSettingsDialog(tk.Toplevel):
         for option in self._account_options:
             row = tk.Frame(section, bg=self.theme.CARD, bd=0)
             row.pack(fill="x", pady=2)
-            row.grid_columnconfigure(1, weight=1)
+            row.grid_columnconfigure(0, weight=1)
+
+            # Keep the title inside the Radiobutton. An empty Tk Radiobutton
+            # collapses its keyboard-focus rectangle into a stray vertical
+            # line beside the indicator on Windows.
             button = tk.Radiobutton(
                 row,
+                text=option.title,
                 variable=self.account_type_value,
                 value=option.value,
                 command=self._account_type_changed,
@@ -172,21 +179,13 @@ class WalletSettingsDialog(tk.Toplevel):
                 activeforeground=self.theme.TEXT,
                 disabledforeground=self.theme.MUTED_2,
                 selectcolor=self.theme.CARD,
+                font=self.theme.font_body,
+                anchor="w",
                 cursor="hand2" if option.enabled else "arrow",
                 state="normal" if option.enabled else "disabled",
                 takefocus=option.enabled,
             )
-            button.grid(row=0, column=0, rowspan=2, sticky="n", padx=(0, 6))
-            title = tk.Label(
-                row,
-                text=option.title,
-                bg=self.theme.CARD,
-                fg=self.theme.TEXT if option.enabled else self.theme.MUTED,
-                font=self.theme.font_body,
-                anchor="w",
-                cursor="hand2" if option.enabled else "arrow",
-            )
-            title.grid(row=0, column=1, sticky="ew")
+            button.grid(row=0, column=0, sticky="ew")
             detail = tk.Label(
                 row,
                 text=option.detail,
@@ -196,9 +195,9 @@ class WalletSettingsDialog(tk.Toplevel):
                 anchor="w",
                 cursor="hand2" if option.enabled else "arrow",
             )
-            detail.grid(row=1, column=1, sticky="ew")
+            detail.grid(row=1, column=0, sticky="ew", padx=(34, 0))
             if option.enabled:
-                for widget in (row, title, detail):
+                for widget in (row, detail):
                     widget.bind(
                         "<Button-1>",
                         lambda _event, radio=button: radio.invoke(),
