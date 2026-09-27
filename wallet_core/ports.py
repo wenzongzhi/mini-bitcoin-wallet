@@ -10,6 +10,7 @@ from .models import (
     BroadcastResult,
     FeeRateEstimate,
     TransactionStatus,
+    WalletReceiveActivity,
     WalletAccountActivation,
     WalletCreation,
     WalletSnapshot,
@@ -56,6 +57,10 @@ class WalletService(ABC):
     @abstractmethod
     def fee_estimates(self) -> tuple[FeeRateEstimate, ...]:
         """Return backend fee estimates without exposing Platform DTOs."""
+
+    @abstractmethod
+    def receive_activity(self) -> WalletReceiveActivity:
+        """Probe every issued receive address without synchronizing the wallet."""
 
     @abstractmethod
     def get_mnemonic(self, password: str | None) -> str:

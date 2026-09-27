@@ -95,6 +95,43 @@ class WalletMetadata:
 
 
 @dataclass(frozen=True, slots=True)
+class WalletReceiveActivity:
+    """Aggregate Esplora activity for every issued receive address."""
+
+    address_count: int
+    chain_tx_count: int
+    chain_funded_txo_count: int
+    chain_spent_txo_count: int
+    chain_funded_sats: int
+    chain_spent_sats: int
+    mempool_tx_count: int
+    mempool_funded_txo_count: int
+    mempool_spent_txo_count: int
+    mempool_funded_sats: int
+    mempool_spent_sats: int
+
+    @property
+    def has_history(self) -> bool:
+        """Return whether any issued receive address has transaction history."""
+
+        return any(
+            value > 0
+            for value in (
+                self.chain_tx_count,
+                self.chain_funded_txo_count,
+                self.chain_spent_txo_count,
+                self.chain_funded_sats,
+                self.chain_spent_sats,
+                self.mempool_tx_count,
+                self.mempool_funded_txo_count,
+                self.mempool_spent_txo_count,
+                self.mempool_funded_sats,
+                self.mempool_spent_sats,
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WalletState:
     metadata: WalletMetadata
     authoritative_balance_sats: int
@@ -107,6 +144,7 @@ class WalletState:
     transactions: tuple[AccountedTransaction, ...]
     synced_at: datetime | None
     pending_txids: tuple[str, ...]
+    receive_activity: WalletReceiveActivity | None = None
 
     @property
     def balance_sats(self) -> int:
@@ -137,6 +175,58 @@ class TransactionStatus:
     confirmed: bool
     block_height: int | None = None
     block_time: datetime | None = None
+
+
+_ACTIVITY_FIELDS = (
+    "tx_count",
+    "funded_txo_count",
+    "spent_txo_count",
+    "funded_txo_sum",
+    "spent_txo_sum",
+)
+
+
+def _receive_activity_from_payloads(
+    payloads: list[dict],
+    *,
+    address_count: int | None = None,
+) -> WalletReceiveActivity:
+    """Build one stable fingerprint from Esplora address-stat payloads."""
+
+    totals = {
+        (scope, field): 0
+        for scope in ("chain_stats", "mempool_stats")
+        for field in _ACTIVITY_FIELDS
+    }
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            raise WalletError("backend returned invalid receive address activity")
+        for scope in ("chain_stats", "mempool_stats"):
+            stats = payload.get(scope)
+            if not isinstance(stats, dict):
+                raise WalletError("backend returned invalid receive address activity")
+            for field in _ACTIVITY_FIELDS:
+                value = stats.get(field, 0)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise WalletError("backend returned invalid receive address activity")
+                totals[(scope, field)] += value
+
+    normalized_count = len(payloads) if address_count is None else address_count
+    if normalized_count < len(payloads):
+        raise WalletError("wallet receive activity address count is invalid")
+    return WalletReceiveActivity(
+        address_count=normalized_count,
+        chain_tx_count=totals[("chain_stats", "tx_count")],
+        chain_funded_txo_count=totals[("chain_stats", "funded_txo_count")],
+        chain_spent_txo_count=totals[("chain_stats", "spent_txo_count")],
+        chain_funded_sats=totals[("chain_stats", "funded_txo_sum")],
+        chain_spent_sats=totals[("chain_stats", "spent_txo_sum")],
+        mempool_tx_count=totals[("mempool_stats", "tx_count")],
+        mempool_funded_txo_count=totals[("mempool_stats", "funded_txo_count")],
+        mempool_spent_txo_count=totals[("mempool_stats", "spent_txo_count")],
+        mempool_funded_sats=totals[("mempool_stats", "funded_txo_sum")],
+        mempool_spent_sats=totals[("mempool_stats", "spent_txo_sum")],
+    )
 
 
 class WalletService:
@@ -458,6 +548,7 @@ class WalletService:
             else ()
         )
         synced_at = _parse_timestamp(wallet_cache.get("synced_at"))
+        receive_activity = self._cached_receive_activity(name, wallet_cache)
         return WalletState(
             metadata,
             balance.authoritative_sats,
@@ -470,6 +561,7 @@ class WalletService:
             transactions,
             synced_at,
             pending_txids,
+            receive_activity,
         )
 
     def get_receive_address(
@@ -679,6 +771,42 @@ class WalletService:
             block_height = None
         return TransactionStatus(txid, confirmed, block_height, block_time)
 
+    def receive_activity(self, name: str) -> WalletReceiveActivity:
+        """Probe all issued receive addresses using address statistics only.
+
+        The probe covers every enabled account type, skips change addresses,
+        and never reads UTXOs or transaction history. It is intentionally
+        read-only: neither wallet metadata nor the wallet cache is modified.
+        """
+
+        self._metadata(name)
+        address_book = get_wallet_address_book(
+            name,
+            wallet_file=self.wallet_file,
+            network=self.network,
+        )
+        receive_entries = [
+            entry
+            for entry in address_book["addresses"]
+            if entry.get("branch") == BTC_RECEIVE_BRANCH
+        ]
+        backend = self.backend_factory(self.network)
+        if getattr(backend, "network", None) != self.network:
+            raise WalletError(
+                "wallet activity backend network does not match wallet"
+            )
+
+        payloads = []
+        for entry in receive_entries:
+            try:
+                payloads.append(backend.get_address(entry["address"]))
+            except Exception as exc:
+                raise WalletError(
+                    f'wallet receive activity probe failed for "{entry["address"]}": '
+                    f"{exc}"
+                ) from exc
+        return _receive_activity_from_payloads(payloads)
+
     def resolve_address_type(self, address_type: str | None = None) -> str:
         """Return one canonical account type without mutating service context."""
 
@@ -692,6 +820,45 @@ class WalletService:
         if match is None:
             raise WalletError(f'wallet "{name}" does not exist on {self.network}')
         return match
+
+    def _cached_receive_activity(
+        self,
+        name: str,
+        wallet_cache: dict,
+    ) -> WalletReceiveActivity | None:
+        """Reuse full-sync address stats as the next probe baseline.
+
+        Older caches may not contain complete address statistics. Returning
+        ``None`` keeps them readable and lets the live probe establish a new
+        baseline without a cache migration.
+        """
+
+        addresses = wallet_cache.get("addresses")
+        if not isinstance(addresses, list):
+            return None
+        receive_entries = [
+            entry
+            for entry in addresses
+            if isinstance(entry, dict)
+            and entry.get("branch") == BTC_RECEIVE_BRANCH
+        ]
+        address_book = get_wallet_address_book(
+            name,
+            wallet_file=self.wallet_file,
+            network=self.network,
+        )
+        issued_receive_count = sum(
+            1
+            for entry in address_book["addresses"]
+            if entry.get("branch") == BTC_RECEIVE_BRANCH
+        )
+        try:
+            return _receive_activity_from_payloads(
+                receive_entries,
+                address_count=issued_receive_count,
+            )
+        except WalletError:
+            return None
 
     @staticmethod
     def _next_receive_index(receive_entries: list[dict]) -> int:

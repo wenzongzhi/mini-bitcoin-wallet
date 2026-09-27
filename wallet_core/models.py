@@ -135,6 +135,63 @@ class FeeRateSchedule:
 
 
 @dataclass(frozen=True, slots=True)
+class WalletReceiveActivity:
+    """Product DTO for a wallet-wide receive-address activity fingerprint."""
+
+    address_count: int
+    chain_tx_count: int
+    chain_funded_txo_count: int
+    chain_spent_txo_count: int
+    chain_funded_sats: int
+    chain_spent_sats: int
+    mempool_tx_count: int
+    mempool_funded_txo_count: int
+    mempool_spent_txo_count: int
+    mempool_funded_sats: int
+    mempool_spent_sats: int
+
+    def __post_init__(self) -> None:
+        values = (
+            self.address_count,
+            self.chain_tx_count,
+            self.chain_funded_txo_count,
+            self.chain_spent_txo_count,
+            self.chain_funded_sats,
+            self.chain_spent_sats,
+            self.mempool_tx_count,
+            self.mempool_funded_txo_count,
+            self.mempool_spent_txo_count,
+            self.mempool_funded_sats,
+            self.mempool_spent_sats,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in values
+        ):
+            raise ValueError(
+                "wallet receive activity values must be non-negative integers"
+            )
+
+    @property
+    def has_history(self) -> bool:
+        return any(
+            value > 0
+            for value in (
+                self.chain_tx_count,
+                self.chain_funded_txo_count,
+                self.chain_spent_txo_count,
+                self.chain_funded_sats,
+                self.chain_spent_sats,
+                self.mempool_tx_count,
+                self.mempool_funded_txo_count,
+                self.mempool_spent_txo_count,
+                self.mempool_funded_sats,
+                self.mempool_spent_sats,
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WalletSnapshot:
     name: str
     # `balance` is the effective aggregate amount shown by the UI. `account_type`
@@ -155,6 +212,7 @@ class WalletSnapshot:
     is_initialized: bool = True
     synced_at: datetime | None = None
     pending_txids: tuple[str, ...] = ()
+    receive_activity: WalletReceiveActivity | None = None
 
 
 @dataclass(frozen=True, slots=True)

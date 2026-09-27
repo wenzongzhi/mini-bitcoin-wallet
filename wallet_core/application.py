@@ -12,6 +12,7 @@ from .models import (
     FeeRateEstimate,
     FeeRateSchedule,
     TransactionStatus,
+    WalletReceiveActivity,
     WalletAccountActivation,
     WalletCreation,
     WalletSnapshot,
@@ -76,6 +77,11 @@ class WalletApplication:
         if not estimates:
             raise ValueError("The network backend returned no fee estimates.")
         return tuple(sorted(estimates, key=lambda estimate: estimate.target_blocks))
+
+    def receive_activity(self) -> WalletReceiveActivity:
+        """Return a read-only wallet-wide incoming activity fingerprint."""
+
+        return self._service.receive_activity()
 
     def fee_rate_schedule(self) -> FeeRateSchedule:
         """Map backend estimates to the four fee choices presented by the UI.

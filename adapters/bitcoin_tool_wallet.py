@@ -15,6 +15,7 @@ from wallet.service import TransactionStatus as PlatformTransactionStatus
 from wallet.service import WalletCreationResult as PlatformWalletCreationResult
 from wallet.service import WalletError
 from wallet.service import WalletMetadata as PlatformWalletMetadata
+from wallet.service import WalletReceiveActivity as PlatformWalletReceiveActivity
 from wallet.service import WalletService as PlatformWalletService
 from wallet.service import WalletState as PlatformWalletState
 from wallet_core.models import (
@@ -28,6 +29,7 @@ from wallet_core.models import (
     TransactionSummary,
     WalletAccountActivation,
     WalletCreation,
+    WalletReceiveActivity,
     WalletSnapshot,
     WalletSummary,
     WithdrawalDraft,
@@ -174,6 +176,16 @@ class BitcoinToolWalletService(WalletService):
             )
             for estimate in estimates
         )
+
+    def receive_activity(self) -> WalletReceiveActivity:
+        """Probe all issued receive addresses for the active wallet."""
+
+        wallet_name = self._require_active_wallet()
+        try:
+            activity = self.platform_wallet.receive_activity(wallet_name)
+        except WalletError as exc:
+            raise ValueError(str(exc)) from exc
+        return self._receive_activity(activity)
 
     def snapshot(self) -> WalletSnapshot:
         wallet_name, account_type = self._active_selection()
@@ -441,6 +453,11 @@ class BitcoinToolWalletService(WalletService):
             is_initialized=True,
             synced_at=state.synced_at,
             pending_txids=state.pending_txids,
+            receive_activity=(
+                self._receive_activity(state.receive_activity)
+                if state.receive_activity is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -505,4 +522,22 @@ class BitcoinToolWalletService(WalletService):
             status.confirmed,
             status.block_height,
             status.block_time,
+        )
+
+    @staticmethod
+    def _receive_activity(
+        activity: PlatformWalletReceiveActivity,
+    ) -> WalletReceiveActivity:
+        return WalletReceiveActivity(
+            address_count=activity.address_count,
+            chain_tx_count=activity.chain_tx_count,
+            chain_funded_txo_count=activity.chain_funded_txo_count,
+            chain_spent_txo_count=activity.chain_spent_txo_count,
+            chain_funded_sats=activity.chain_funded_sats,
+            chain_spent_sats=activity.chain_spent_sats,
+            mempool_tx_count=activity.mempool_tx_count,
+            mempool_funded_txo_count=activity.mempool_funded_txo_count,
+            mempool_spent_txo_count=activity.mempool_spent_txo_count,
+            mempool_funded_sats=activity.mempool_funded_sats,
+            mempool_spent_sats=activity.mempool_spent_sats,
         )

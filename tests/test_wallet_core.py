@@ -16,6 +16,7 @@ from wallet_core import (
     DisplayUnit,
     FeeRateEstimate,
     WalletApplication,
+    WalletReceiveActivity,
 )
 from wallet import get_new_address, get_wallet_address_book
 
@@ -228,6 +229,12 @@ class WalletApplicationTests(TestCase):
         self.assertEqual(draft.fee_rate_sat_vb, 80)
         self.assertEqual(draft.estimated_fee.sats, 11_200)
 
+    def test_receive_activity_stays_behind_application_boundary(self):
+        activity = self.application.receive_activity()
+
+        self.assertIsInstance(activity, WalletReceiveActivity)
+        self.assertEqual(activity, DemoWalletService.RECEIVE_ACTIVITY)
+
 
 class BitcoinToolWalletServiceTests(TestCase):
     def setUp(self):
@@ -275,6 +282,21 @@ class BitcoinToolWalletServiceTests(TestCase):
                 FeeRateEstimate(6, Decimal("4.5")),
             ),
         )
+
+    def test_receive_activity_is_mapped_from_platform_service(self):
+        backend = FakeEsploraBackend()
+        service = BitcoinToolWalletService(
+            self.wallet_file,
+            self.wallet_file.parent / "activity-cache.json",
+            settings_store=self.settings_store,
+            backend_factory=lambda _network: backend,
+        )
+        service.create_wallet("ActivityWallet", "password")
+
+        activity = service.receive_activity()
+
+        self.assertIsInstance(activity, WalletReceiveActivity)
+        self.assertEqual(activity.address_count, 1)
 
     def test_multiple_wallets_can_coexist_and_be_listed_without_secrets(self):
         mnemonics = []

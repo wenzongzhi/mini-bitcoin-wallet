@@ -1,8 +1,8 @@
 """Background synchronization policy for the desktop wallet.
 
 Full wallet scans are deliberately event-driven because public Esplora servers
-are a shared resource.  Lightweight transaction-status requests are scheduled
-separately and stop after the transaction is confirmed.
+are a shared resource. Lightweight receive-activity and transaction-status
+probes are scheduled independently and share one serialized worker.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import time
 import tkinter as tk
 
 from state import WalletUIState
+from wallet_core import WalletReceiveActivity
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,7 @@ class SyncPolicy:
     status_fast_interval: int = 30
     status_fast_window: int = 10 * 60
     status_slow_interval: int = 120
+    receive_probe_interval: int = 60
     maximum_backoff: int = 15 * 60
 
     def status_interval(self, monitored_for: float) -> int:
@@ -40,7 +42,7 @@ class SyncPolicy:
 
 
 class WalletSyncCoordinator:
-    """Serialize wallet scans and cheaply monitor unconfirmed transactions."""
+    """Serialize wallet work and run independent low-cost activity probes."""
 
     def __init__(
         self,
@@ -57,11 +59,18 @@ class WalletSyncCoordinator:
         self._closed = False
         self._poll_job = None
         self._status_job = None
+        self._activity_job = None
         self._failures = 0
         self._next_automatic_attempt = 0.0
         self._first_monitored: dict[tuple[str, str], float] = {}
         self._last_status_check: dict[tuple[str, str], float] = {}
         self._confirmed_transactions: set[tuple[str, str]] = set()
+        self._receive_activity_baselines: dict[str, WalletReceiveActivity] = {}
+        initial_activity = getattr(state, "receive_activity_baseline", None)
+        if state.active_wallet_name is not None and initial_activity is not None:
+            self._receive_activity_baselines[state.active_wallet_name] = (
+                initial_activity
+            )
 
         root.bind("<<ActiveWalletChanged>>", self._wallet_changed, add="+")
         root.bind("<<WalletRefreshRequested>>", self._manual_refresh, add="+")
@@ -74,12 +83,13 @@ class WalletSyncCoordinator:
             return
         self.root.after(250, lambda: self.request_full_sync("startup"))
         self._schedule_status_check()
+        self._schedule_activity_check()
 
     def close(self) -> None:
         """Stop scheduling callbacks; running daemon work may finish naturally."""
 
         self._closed = True
-        for job in (self._poll_job, self._status_job):
+        for job in (self._poll_job, self._status_job, self._activity_job):
             if job is not None:
                 try:
                     self.root.after_cancel(job)
@@ -111,6 +121,10 @@ class WalletSyncCoordinator:
 
     def _wallet_changed(self, _event=None) -> None:
         self._discard_other_wallet_monitoring()
+        wallet_name = self.state.active_wallet_name
+        activity = getattr(self.state, "receive_activity_baseline", None)
+        if wallet_name is not None and activity is not None:
+            self._receive_activity_baselines[wallet_name] = activity
         self.request_full_sync("wallet-change")
 
     def _manual_refresh(self, _event=None) -> None:
@@ -149,10 +163,14 @@ class WalletSyncCoordinator:
 
         self._poll_job = None
         self._worker_active = False
+        detected_sync: tuple[str, str] | None = None
         if error is not None:
             self._record_failure(kind, error, wallet_name)
         elif kind == "full":
             self._record_success()
+            activity = getattr(result, "receive_activity", None)
+            if activity is not None:
+                self._receive_activity_baselines[wallet_name] = activity
             if self.state.apply_synchronized_snapshot(result):
                 updated = datetime.now().strftime("%H:%M:%S")
                 self.state.set_sync_activity(False, f"Updated {updated}")
@@ -167,21 +185,30 @@ class WalletSyncCoordinator:
                 (wallet_name, txid) for txid in confirmed_txids
             )
             if wallet_name == self.state.active_wallet_name and confirmed_txids:
-                self.request_full_sync("transaction-confirmed")
+                detected_sync = ("transaction-confirmed", wallet_name)
             elif wallet_name == self.state.active_wallet_name:
                 self.state.set_sync_activity(
                     False,
                     "Waiting for transaction confirmation",
                 )
+        elif kind == "activity":
+            self._record_success()
+            if wallet_name == self.state.active_wallet_name:
+                baseline = self._receive_activity_baselines.get(wallet_name)
+                if baseline is None:
+                    if result.has_history:
+                        detected_sync = ("incoming-activity", wallet_name)
+                    else:
+                        self._receive_activity_baselines[wallet_name] = result
+                elif result != baseline:
+                    detected_sync = ("incoming-activity", wallet_name)
 
         pending = self._pending_full_sync
         self._pending_full_sync = None
-        if pending is not None:
-            reason, pending_wallet = pending
-            self.root.after(
-                0,
-                lambda: self.request_full_sync(reason, wallet_name=pending_wallet),
-            )
+        requested_sync = pending or detected_sync
+        if requested_sync is not None:
+            reason, requested_wallet = requested_sync
+            self.request_full_sync(reason, wallet_name=requested_wallet)
 
     def _record_success(self) -> None:
         self._failures = 0
@@ -197,15 +224,15 @@ class WalletSyncCoordinator:
         delay = self.policy.retry_delay(self._failures)
         self._next_automatic_attempt = time.monotonic() + delay
         if wallet_name == self.state.active_wallet_name:
-            message = (
-                f"Confirmation check unavailable · retrying in {delay}s"
-                if kind == "status"
-                else "Sync unavailable · use Refresh to retry"
-            )
-            self.state.set_sync_activity(
-                False,
-                message,
-            )
+            if kind == "status":
+                message = f"Confirmation check unavailable · retrying in {delay}s"
+            elif kind == "full":
+                message = "Sync unavailable · use Refresh to retry"
+            else:
+                # Incoming probes are passive. Retry quietly rather than
+                # replacing a useful sync or confirmation status in the UI.
+                return
+            self.state.set_sync_activity(False, message)
 
     def _schedule_status_check(self) -> None:
         if self._closed:
@@ -248,6 +275,31 @@ class WalletSyncCoordinator:
         self._discard_other_wallet_monitoring()
         self._schedule_status_check()
 
+    def _schedule_activity_check(self) -> None:
+        if self._closed:
+            return
+        self._activity_job = self.root.after(
+            self.policy.receive_probe_interval * 1000,
+            self._activity_check,
+        )
+
+    def _activity_check(self) -> None:
+        """Run one wallet-wide receive-address statistics probe when idle."""
+
+        self._activity_job = None
+        wallet_name = self.state.active_wallet_name
+        if (
+            wallet_name is not None
+            and not self._worker_active
+            and time.monotonic() >= self._next_automatic_attempt
+        ):
+            self._start_worker(
+                "activity",
+                wallet_name,
+                self.state.application.receive_activity,
+            )
+        self._schedule_activity_check()
+
     def _discard_other_wallet_monitoring(self) -> None:
         wallet_name = self.state.active_wallet_name
         active_keys = {
@@ -263,4 +315,9 @@ class WalletSyncCoordinator:
             key: value
             for key, value in self._last_status_check.items()
             if key in active_keys
+        }
+        self._receive_activity_baselines = {
+            name: activity
+            for name, activity in self._receive_activity_baselines.items()
+            if name == wallet_name
         }

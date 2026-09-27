@@ -14,6 +14,7 @@ from wallet_core.models import (
     TransactionSummary,
     WalletAccountActivation,
     WalletCreation,
+    WalletReceiveActivity,
     WalletSnapshot,
     WalletSummary,
     WithdrawalDraft,
@@ -30,6 +31,19 @@ class DemoWalletService(WalletService):
         AccountType.NATIVE_SEGWIT: "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
         AccountType.LEGACY: "1BoatSLRHtKNngkdXEeobR76b53LETtpyT",
     }
+    RECEIVE_ACTIVITY = WalletReceiveActivity(
+        address_count=2,
+        chain_tx_count=3,
+        chain_funded_txo_count=2,
+        chain_spent_txo_count=1,
+        chain_funded_sats=618_203,
+        chain_spent_sats=210_203,
+        mempool_tx_count=0,
+        mempool_funded_txo_count=0,
+        mempool_spent_txo_count=0,
+        mempool_funded_sats=0,
+        mempool_spent_sats=0,
+    )
 
     def __init__(self) -> None:
         self._demo_draft = None
@@ -43,6 +57,7 @@ class DemoWalletService(WalletService):
             unconfirmed_chain_balance=BitcoinAmount(0),
             pending_delta=BitcoinAmount(0),
             available_balance=BitcoinAmount(408_000),
+            receive_activity=self.RECEIVE_ACTIVITY,
             transactions=(
                 self._transaction("demo-outgoing", -210_203),
                 self._transaction("demo-incoming-1", 179_475),
@@ -129,6 +144,11 @@ class DemoWalletService(WalletService):
             FeeRateEstimate(144, Decimal("1.1")),
         )
 
+    def receive_activity(self) -> WalletReceiveActivity:
+        if not self._snapshot.is_initialized:
+            raise ValueError("Create or import a wallet before continuing.")
+        return self._snapshot.receive_activity or self.RECEIVE_ACTIVITY
+
     def get_mnemonic(self, password: str | None) -> str:
         return "demo mnemonic"
 
@@ -166,6 +186,7 @@ class DemoWalletService(WalletService):
             receive_address=self.RECEIVE_ADDRESSES[AccountType.NATIVE_SEGWIT],
             account_type=AccountType.NATIVE_SEGWIT,
             is_initialized=True,
+            receive_activity=self.RECEIVE_ACTIVITY,
         )
         return WalletCreation(self._snapshot, "demo mnemonic")
 
@@ -181,6 +202,7 @@ class DemoWalletService(WalletService):
             receive_address=self.RECEIVE_ADDRESSES[AccountType.NATIVE_SEGWIT],
             account_type=AccountType.NATIVE_SEGWIT,
             is_initialized=True,
+            receive_activity=self.RECEIVE_ACTIVITY,
         )
         return WalletCreation(self._snapshot, generated_mnemonic=None)
 

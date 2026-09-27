@@ -15,6 +15,7 @@ from wallet_core import (
     WalletApplication,
     WalletAccountActivation,
     WalletCreation,
+    WalletReceiveActivity,
     WalletSnapshot,
     WalletSummary,
     WithdrawalDraft,
@@ -289,6 +290,17 @@ class WalletUIState:
         """Load product-ready fee choices without coupling pages to Platform."""
 
         return self.application.fee_rate_schedule()
+
+    def receive_activity(self) -> WalletReceiveActivity:
+        """Run the lightweight incoming-payment probe for the active wallet."""
+
+        return self.application.receive_activity()
+
+    @property
+    def receive_activity_baseline(self) -> WalletReceiveActivity | None:
+        """Return address statistics captured by the latest full sync."""
+
+        return self._snapshot.receive_activity
 
     def sign_withdrawal(
         self, draft_id: str, password: str | None
