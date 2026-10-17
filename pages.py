@@ -57,7 +57,7 @@ class WalletSelector(tk.Frame):
         self.arrow_label.pack(side="left", pady=(theme.px(3), 0))
 
         for widget in (self, self.name_label, self.arrow_label):
-            widget.bind("<Button-1>", self._show_menu)
+            widget.bind("<ButtonRelease-1>", self._show_menu)
         self.bind("<Return>", self._show_menu)
         self.bind("<space>", self._show_menu)
 
@@ -78,6 +78,7 @@ class WalletSelector(tk.Frame):
             menu.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.winfo_height())
         finally:
             menu.grab_release()
+        return "break"
 
     def _new_menu(self) -> tk.Menu:
         return tk.Menu(
@@ -136,10 +137,16 @@ class WalletHeader(tk.Frame):
         self.right.grid(row=0, column=1, sticky="ne")
 
         menu_button = tk.Label(self.right, text="...", bg=theme.CARD, fg=theme.MUTED,
-                               font=theme.font_menu, cursor="hand2", padx=4)
+                               font=theme.font_menu, cursor="hand2", padx=4,
+                               takefocus=True)
         menu_button.pack(anchor="e", pady=(0, theme.px(1)))
+        self.menu_button = menu_button
         self.menu = self._build_menu()
-        menu_button.bind("<Button-1>", self._show_menu)
+        # Finish the opening click before posting: X11 menus can invoke an
+        # entry on the same button release if they are posted during the press.
+        menu_button.bind("<ButtonRelease-1>", self._show_menu)
+        menu_button.bind("<Return>", self._show_menu)
+        menu_button.bind("<space>", self._show_menu)
         menu_button.bind("<Enter>", lambda e: menu_button.configure(fg=theme.TEXT_SOFT))
         menu_button.bind("<Leave>", lambda e: menu_button.configure(fg=theme.MUTED))
         BitcoinLogo(self.right, theme).pack(anchor="e")
@@ -219,15 +226,22 @@ class WalletHeader(tk.Frame):
     def _show_about(self):
         show_about_wallet(self.winfo_toplevel(), self.theme)
 
-    def _show_menu(self, event):
+    def _show_menu(self, event=None):
         self.menu.entryconfigure(
             self._wallet_settings_menu_index,
             state="normal" if self.state.is_initialized else "disabled",
         )
+        # Anchor below the trigger instead of placing the first entry beneath
+        # the pointer. This also gives keyboard activation a stable position.
+        self.menu.activate("none")
         try:
-            self.menu.tk_popup(event.x_root, event.y_root)
+            self.menu.tk_popup(
+                self.menu_button.winfo_rootx(),
+                self.menu_button.winfo_rooty() + self.menu_button.winfo_height(),
+            )
         finally:
             self.menu.grab_release()
+        return "break"
 
 
 class BackButton(tk.Label):

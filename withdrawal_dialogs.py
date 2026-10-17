@@ -42,6 +42,8 @@ def _run_with_progress(
     indicator = ttk.Progressbar(progress, mode="indeterminate", length=280)
     indicator.pack(padx=24, pady=(0, 20))
     indicator.start(12)
+    progress.update_idletasks()
+    progress.wait_visibility()
     progress.grab_set()
 
     results = Queue(maxsize=1)
