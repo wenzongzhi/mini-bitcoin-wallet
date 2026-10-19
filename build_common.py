@@ -1,4 +1,8 @@
-"""Shared, location-independent PyInstaller build pipeline."""
+"""Build native executables on Windows and Linux, including Raspberry Pi.
+
+PyInstaller uses the current Python environment and host architecture. Run this
+pipeline on the target system; a Windows build cannot produce a Linux ARM64 ELF.
+"""
 
 from dataclasses import dataclass
 import os
@@ -28,22 +32,33 @@ class BuildTarget:
         return PROJECT_DIRECTORY / self.entry_filename
 
 
+def executable_filename(name: str) -> str:
+    """Windows executables use .exe; Linux ELF files have no added suffix."""
+
+    return f"{name}.exe" if sys.platform == "win32" else name
+
+
 def pyinstaller_command(target: BuildTarget) -> list[str]:
-    """Create an argument list containing only absolute filesystem paths."""
+    """Create native build arguments with absolute source and output paths."""
 
     bundled_icon_directory = f"{ICON_DIRECTORY}{os.pathsep}icon"
-    return [
+    command = [
         sys.executable,
         "-m",
         "PyInstaller",
         "--clean",
         "--noconfirm",
         "--onefile",
+        # PyInstaller ignores -w on Linux; it selects GUI mode on Windows.
         "-w",
         "--name",
         target.executable_name,
-        "--icon",
-        str(WINDOWS_ICON_PATH),
+        # Include bundled/shared secp256k1 libraries from source-built installs
+        # as well as wheels. CFFI's extension import is invisible to analysis.
+        "--collect-binaries",
+        "coincurve",
+        "--hidden-import",
+        "_cffi_backend",
         "--add-data",
         bundled_icon_directory,
         "--paths",
@@ -54,24 +69,46 @@ def pyinstaller_command(target: BuildTarget) -> list[str]:
         str(BUILD_DIRECTORY / target.executable_name),
         "--specpath",
         str(SPEC_DIRECTORY),
-        str(target.entry_path),
     ]
+    if sys.platform == "win32":
+        command.extend(["--icon", str(WINDOWS_ICON_PATH)])
+    command.append(str(target.entry_path))
+    return command
+
+
+def _prepare_icon_assets() -> None:
+    """Regenerate Windows icons; use checked-in runtime PNGs on Linux."""
+
+    required_assets = [
+        ICON_DIRECTORY / "bitcoin_logo.png",
+        ICON_DIRECTORY / "bitcoin_titlebar_icon.png",
+    ]
+    if sys.platform == "win32":
+        if not CREATE_ICON_SCRIPT.is_file():
+            raise FileNotFoundError(f"Icon generator not found: {CREATE_ICON_SCRIPT}")
+        subprocess.check_call(
+            [sys.executable, str(CREATE_ICON_SCRIPT)], cwd=PROJECT_DIRECTORY
+        )
+        required_assets.append(WINDOWS_ICON_PATH)
+    for asset in required_assets:
+        if not asset.is_file():
+            raise FileNotFoundError(f"Required application icon not found: {asset}")
 
 
 def build_executable(target: BuildTarget) -> Path:
-    """Regenerate icons and build one windowed, single-file executable."""
+    """Build one native, single-file executable and verify that it exists."""
 
     if not target.entry_path.is_file():
         raise FileNotFoundError(f"Entry point not found: {target.entry_path}")
-    if not CREATE_ICON_SCRIPT.is_file():
-        raise FileNotFoundError(f"Icon generator not found: {CREATE_ICON_SCRIPT}")
 
+    _prepare_icon_assets()
     SPEC_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    subprocess.check_call(
-        [sys.executable, str(CREATE_ICON_SCRIPT)], cwd=PROJECT_DIRECTORY
-    )
     subprocess.check_call(pyinstaller_command(target), cwd=PROJECT_DIRECTORY)
 
-    executable = DIST_DIRECTORY / f"{target.executable_name}.exe"
+    executable = DIST_DIRECTORY / executable_filename(target.executable_name)
+    if not executable.is_file():
+        raise FileNotFoundError(
+            f"PyInstaller finished without producing the expected executable: {executable}"
+        )
     print(f"Build finished successfully: {executable}")
     return executable

@@ -1,4 +1,4 @@
-"""Build the mainnet wallet as a windowed Windows executable."""
+"""Build the mainnet wallet natively on Windows or Linux (including ARM64)."""
 
 from build_common import BuildTarget, build_executable
 

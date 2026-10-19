@@ -147,18 +147,56 @@ It uses the Platform-standard `wallets_testnet4.json` and
 `wallet_cache_testnet4.json`; mainnet files are never reused. The window title
 is marked `TESTNET4`.
 
-Build windowed, single-file executables from any working directory with:
+## Build
+
+Build native, single-file executables using the current Python environment:
 
 ```bash
 python build_mainnet.py
 python build_testnet4.py
 ```
 
-The outputs are `dist/mini_bitcoin_wallet.exe` and
-`dist/mini_bitcoin_wallet_testnet4.exe`. New packaged installations keep wallet
-and cache files beside the application settings in Mini Bitcoin Wallet's user
-configuration directory; Settings → Storage can select another directory
-containing the standard wallet filename.
+Paths are resolved relative to the build scripts, so calling a script by its
+absolute path also works from another working directory. Windows outputs are
+`dist/mini_bitcoin_wallet.exe` and `dist/mini_bitcoin_wallet_testnet4.exe`.
+
+### Raspberry Pi 3B+ / 64-bit Linux
+
+Build on the Pi itself using 64-bit Linux and a 64-bit Python environment in
+which `python app.py` already works, including Tkinter and coincurve. PyInstaller
+builds for the host OS and architecture; Windows builds cannot produce ARM64
+Linux executables. Linux build tools `ldd`, `objdump`, and `objcopy` are required
+(Debian/Raspberry Pi OS packages: `libc-bin` and `binutils`).
+
+```bash
+cd ~/github/mini-bitcoin-wallet
+source .venv/bin/activate
+uname -m                    # aarch64
+python -c "import struct; print(struct.calcsize('P') * 8)"  # 64
+python build_mainnet.py
+python build_testnet4.py
+file dist/mini_bitcoin_wallet dist/mini_bitcoin_wallet_testnet4
+./dist/mini_bitcoin_wallet
+```
+
+The two outputs have no `.exe` suffix and should be reported as 64-bit AArch64
+ELF executables. Launch `./dist/mini_bitcoin_wallet_testnet4` for Testnet4. Build
+the targets sequentially on the Pi; both share PyInstaller's cache.
+
+Linux bundles the checked-in PNG icons without generating a Windows ICO. Both
+builds explicitly collect coincurve binaries and the CFFI backend. After the
+first Pi build, verify startup, icons/QR codes, wallet import, and transaction
+review/signing with a disposable Testnet4 wallet. A desktop session is required
+to run the GUI. If a one-file build cannot load libraries from a `noexec` temp
+directory, launch it with `TMPDIR` pointing to an executable, writable directory.
+
+`-w` suppresses the Windows console; PyInstaller ignores it on Linux. See the
+[PyInstaller options](https://pyinstaller.org/en/stable/usage.html) and
+[Linux requirements](https://pyinstaller.org/en/stable/requirements.html).
+
+New packaged installations keep wallet and cache files beside the application
+settings in Mini Bitcoin Wallet's user configuration directory; Settings →
+Storage can select another directory containing the standard wallet filename.
 
 ## Update the vendored Platform
 
@@ -191,6 +229,7 @@ mini-bitcoin-wallet/
 ├── app.py
 ├── app_metadata.py
 ├── app-testnet4.py
+├── build_common.py
 ├── build_mainnet.py
 ├── build_testnet4.py
 ├── app_settings.py

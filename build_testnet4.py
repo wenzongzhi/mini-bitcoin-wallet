@@ -1,4 +1,4 @@
-"""Build the isolated Testnet4 wallet as a windowed Windows executable."""
+"""Build the isolated Testnet4 wallet natively on Windows or Linux (ARM64)."""
 
 from build_common import BuildTarget, build_executable
 
