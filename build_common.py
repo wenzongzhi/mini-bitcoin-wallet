@@ -59,6 +59,9 @@ def pyinstaller_command(target: BuildTarget) -> list[str]:
         "coincurve",
         "--hidden-import",
         "_cffi_backend",
+        # Pillow's native Tk bridge imports this helper dynamically on Linux.
+        "--hidden-import",
+        "PIL._tkinter_finder",
         "--add-data",
         bundled_icon_directory,
         "--paths",

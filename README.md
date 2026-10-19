@@ -184,7 +184,8 @@ ELF executables. Launch `./dist/mini_bitcoin_wallet_testnet4` for Testnet4. Buil
 the targets sequentially on the Pi; both share PyInstaller's cache.
 
 Linux bundles the checked-in PNG icons without generating a Windows ICO. Both
-builds explicitly collect coincurve binaries and the CFFI backend. After the
+builds explicitly collect coincurve binaries, the CFFI backend, and Pillow's
+dynamically imported `PIL._tkinter_finder` for the Linux ImageTk bridge. After the
 first Pi build, verify startup, icons/QR codes, wallet import, and transaction
 review/signing with a disposable Testnet4 wallet. A desktop session is required
 to run the GUI. If a one-file build cannot load libraries from a `noexec` temp

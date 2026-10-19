@@ -48,7 +48,12 @@ def test_native_build_command_from_another_working_directory(
         f"{PROJECT_DIRECTORY / 'icon'}{separator}icon"
     )
     assert command[command.index("--collect-binaries") + 1] == "coincurve"
-    assert command[command.index("--hidden-import") + 1] == "_cffi_backend"
+    hidden_imports = {
+        command[index + 1]
+        for index, option in enumerate(command[:-1])
+        if option == "--hidden-import"
+    }
+    assert {"_cffi_backend", "PIL._tkinter_finder"} <= hidden_imports
     if build_platform == "win32":
         assert command[command.index("--icon") + 1] == str(
             build_common.WINDOWS_ICON_PATH
